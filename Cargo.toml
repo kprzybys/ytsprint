@@ -1,0 +1,20 @@
+[package]
+name = "ytsprint"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Fast YouTube audio for mpv: a drop-in yt-dlp replacement for ytdl_hook (single videos, playlists, search) with YouTube Premium cookies"
+license = "Unlicense"
+repository = "https://github.com/kprzybys/ytsprint"
+readme = "README.md"
+keywords = ["youtube", "mpv", "yt-dlp", "audio", "music"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.104"
+regex = "1.13.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls", "http2", "cookies", "gzip", "brotli"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+url = "2.5.8"

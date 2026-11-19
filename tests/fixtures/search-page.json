@@ -1,0 +1,19 @@
+{
+  "contents": {"twoColumnSearchResultsRenderer": {"primaryContents": {"sectionListRenderer": {"contents": [
+    {"itemSectionRenderer": {"contents": [
+      {"adSlotRenderer": {"fulfillmentContent": {"fulfilledLayout": {"inFeedAdLayoutRenderer": {"renderingContent": {
+        "lockupViewModel": {"contentId": "adVideo____", "contentType": "LOCKUP_CONTENT_TYPE_VIDEO"}}}}}}},
+      {"videoRenderer": {"videoId": "vidA_______", "title": {"runs": [{"text": "First "}, {"text": "video"}]},
+        "lengthText": {"simpleText": "1:02:03"}}},
+      {"lockupViewModel": {"contentId": "vidB_______", "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {"lockupMetadataViewModel": {"title": {"content": "Lockup video"}}},
+        "contentImage": {"thumbnailViewModel": {"overlays": [{"thumbnailOverlayBadgeViewModel": {"thumbnailBadges": [
+          {"thumbnailBadgeViewModel": {"text": "4:05"}}]}}]}}}},
+      {"lockupViewModel": {"contentId": "PLsomething", "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST"}},
+      {"playlistVideoRenderer": {"videoId": "vidC_______", "title": {"simpleText": "Playlist item"}, "lengthSeconds": "60"}},
+      {"playlistVideoRenderer": {"videoId": "gone_______", "title": {"simpleText": "[Deleted video]"}, "isPlayable": false}},
+      {"videoRenderer": {"videoId": "vidA_______", "title": {"simpleText": "duplicate"}}}
+    ]}},
+    {"continuationItemRenderer": {"continuationEndpoint": {"continuationCommand": {"token": "TOKEN-1"}}}}
+  ]}}}}
+}
