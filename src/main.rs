@@ -1,16 +1,18 @@
 //! ytsprint: a fast path for mpv's ytdl_hook (`ytdl_path`) for YouTube: a video (bestaudio), playlists, search,
 //! with Firefox Premium cookies. What it deliberately does not do (live streams, other sites,
 //! other arguments) goes to yt-dlp. An error on the path it does handle is NOT hidden by yt-dlp:
-//! ytsprint exits with an error that mpv shows. See docs/plan.md.
+//! ytsprint exits with an error that mpv shows. See docs/architecture.md.
 //!
 //!   ytsprint <yt-dlp arguments>          as called by mpv: JSON on stdout or exec yt-dlp
 //!   ytsprint --url <id|URL> [--cookies]  debugging: the stream URL + timings on stderr
 //!   ytsprint search <N> <query>          search: lines "id<TAB>duration_s<TAB>title" (for fzf in `yt`)
 //!   ytsprint jsd                          ytsprint-jsd service: deno with the ejs solver and players in memory
+//!   ytsprint install-service              writes and enables the systemd user unit for ytsprint-jsd
 
 mod browse;
 mod cookies;
 mod extract;
+mod fsutil;
 mod jsc;
 mod locate;
 
@@ -21,22 +23,12 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub fn state_log(line: &str) {
-    let dir = std::env::var("XDG_STATE_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/state", std::env::var("HOME").unwrap_or_default()))
-        + "/ytsprint";
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(format!("{dir}/log"))
-    {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "{ts} {line}");
-    }
+fn state_log(line: &str) {
+    fsutil::log(line)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
 }
 
 enum Target {
@@ -44,11 +36,22 @@ enum Target {
     Playlist(String),
 }
 
+/// YouTube host (www., m., music. prefixes removed), or None for any other site.
+fn youtube_host(u: &url::Url) -> Option<&str> {
+    let host = u
+        .host_str()?
+        .trim_start_matches("www.")
+        .trim_start_matches("m.")
+        .trim_start_matches("music.");
+    matches!(host, "youtube.com" | "youtu.be").then_some(host)
+}
+
 /// What a URL points to. Like yt-dlp: watch?v=X&list=Y with --no-playlist is a single video.
 fn target(arg: &str, no_playlist: bool) -> Option<Target> {
-    let list = url::Url::parse(arg)
-        .ok()
-        .and_then(|u| u.query_pairs().find(|(k, _)| k == "list").map(|(_, v)| v.into_owned()));
+    let list = url::Url::parse(arg).ok().and_then(|u| {
+        youtube_host(&u)?;
+        u.query_pairs().find(|(k, _)| k == "list").map(|(_, v)| v.into_owned())
+    });
     match (video_id_any(arg), list) {
         (Some(id), Some(_)) if no_playlist => Some(Target::Video(id)),
         (_, Some(list))
@@ -77,12 +80,7 @@ fn video_id_any(arg: &str) -> Option<String> {
         return Some(arg.to_string());
     }
     let u = url::Url::parse(arg).ok()?;
-    let host = u
-        .host_str()?
-        .trim_start_matches("www.")
-        .trim_start_matches("m.")
-        .trim_start_matches("music.");
-    let id = match host {
+    let id = match youtube_host(&u)? {
         "youtube.com" if u.path() == "/watch" => u.query_pairs().find(|(k, _)| k == "v")?.1.into_owned(),
         "youtube.com" => u
             .path()
@@ -123,7 +121,7 @@ fn parse_ytdl_args(args: &[String]) -> Option<Request> {
             _ => return None,
         }
     }
-    if !(json && format_ok) || it.next().is_some() {
+    if !(json && format_ok) {
         return None;
     }
     Some(Request {
@@ -132,6 +130,7 @@ fn parse_ytdl_args(args: &[String]) -> Option<Request> {
     })
 }
 
+/// Without Premium YouTube serves the stream only after the pre-roll ad (capped in extract.rs).
 fn wait_until(available_at: u64) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -139,6 +138,7 @@ fn wait_until(available_at: u64) {
         .unwrap_or(0.0);
     let left = available_at as f64 - now;
     if left > 0.0 {
+        eprintln!("ytsprint: waiting {left:.0} s for the pre-roll ad (no YouTube Premium in the cookies?)");
         std::thread::sleep(Duration::from_secs_f64(left));
     }
 }
@@ -247,7 +247,7 @@ fn debug_url(args: &[String]) -> Result<()> {
         a.available_at,
         timings(&a)
     );
-    if std::env::var("YTSPRINT_NO_WAIT").is_err() {
+    if !env_flag("YTSPRINT_NO_WAIT") {
         wait_until(a.available_at);
     }
     eprintln!("[ytsprint] total {} ms", t.elapsed().as_millis());
@@ -255,17 +255,29 @@ fn debug_url(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(e) = run(&args) {
+        // every error, whatever the command, is shown and logged
+        state_log(&format!(
+            "ERROR {}: {e:#}",
+            args.first().map(String::as_str).unwrap_or("")
+        ));
+        eprintln!("ytsprint: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("--url") => return debug_url(&args),
-        Some("search") => return search(&args),
+        Some("--url") => return debug_url(args),
+        Some("search") => return search(args),
         Some("jsd") => return jsc::run_daemon(),
         Some("install-service") => return jsc::install_service(),
         _ => {}
     }
-    if std::env::var("YTSPRINT_FORCE_YTDLP").is_err() {
-        if let Some(req) = parse_ytdl_args(&args) {
+    if !env_flag("YTSPRINT_FORCE_YTDLP") {
+        if let Some(req) = parse_ytdl_args(args) {
             let what = match &req.target {
                 Target::Video(id) => id.clone(),
                 Target::Playlist(l) => format!("playlist {l}"),
@@ -273,19 +285,15 @@ fn main() -> Result<()> {
             match native(&req) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is::<extract::Unsupported>() => state_log(&format!("yt-dlp {what}: {e}")),
-                Err(e) => {
-                    state_log(&format!("ERROR {what} cookies={}: {e:#}", req.cookies));
-                    eprintln!("ytsprint: {e:#}");
-                    std::process::exit(1);
-                }
+                Err(e) => return Err(e.context(format!("{what} cookies={}", req.cookies))),
             }
         } else {
             state_log(&format!("yt-dlp (arguments not handled): {}", args.join(" ")));
         }
     }
     // Requests ytsprint does not handle → yt-dlp with the same arguments.
-    let bin = locate::yt_dlp()?.bin;
-    let err = Command::new(&bin).args(&args).exec();
+    let bin = locate::yt_dlp_for_routing()?;
+    let err = Command::new(&bin).args(args).exec();
     bail!("exec {}: {err}", bin.display())
 }
 
@@ -300,7 +308,8 @@ fn search(args: &[String]) -> Result<()> {
     let entries = browse::search(query, n, cookies)?;
     let mut out = std::io::stdout().lock();
     for e in &entries {
-        let title = e.title.replace(['\t', '\n'], " ");
+        // no control characters (tabs and newlines break the format; ESC etc. would reach the terminal)
+        let title: String = e.title.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
         writeln!(
             out,
             "{}\t{}\t{title}",
@@ -351,6 +360,9 @@ mod tests {
             matches!(target("https://www.youtube.com/playlist?list=LL", true), Some(Target::Playlist(l)) if l == "LL")
         );
         assert!(target("https://www.youtube.com/playlist?list=bad%20id", true).is_none());
+        // list= on another site is not a YouTube playlist (it goes to yt-dlp)
+        assert!(target("https://example.com/watch?list=abc", true).is_none());
+        assert!(target("https://example.com/watch?v=dQw4w9WgXcQ&list=abc", false).is_none());
     }
 
     #[test]

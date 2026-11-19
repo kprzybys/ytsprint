@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use sha1::{Digest, Sha1};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Cookie {
@@ -41,15 +41,35 @@ fn cookies_db() -> Result<PathBuf> {
         .context("cookies.sqlite not found in the Firefox profile")
 }
 
-pub fn firefox_youtube() -> Result<Vec<Cookie>> {
+/// YouTube cookies of the default Firefox context.
+///
+/// The database is copied together with its `-wal` file into a private temporary directory and opened there:
+/// opening the live file with `immutable=1` would ignore the WAL, i.e. cookies Firefox wrote recently
+/// (a fresh login, rotated session cookies). Copying ~3 MB costs a few ms.
+pub fn firefox_youtube() -> Result<(Vec<Cookie>, PathBuf)> {
     let db = cookies_db()?;
-    // immutable=1: read without locks while Firefox is running and holding the database.
-    let uri = format!("file:{}?immutable=1", db.display());
-    let conn = Connection::open_with_flags(uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)?;
+    let tmp = crate::fsutil::runtime_dir()?.join(format!("ytsprint-cookies-{}", std::process::id()));
+    crate::fsutil::private_dir(&tmp)?;
+    let result = read_copy(&db, &tmp);
+    let _ = std::fs::remove_dir_all(&tmp); // best effort: it is our own private temp dir
+    Ok((result?, db))
+}
+
+fn read_copy(db: &Path, tmp: &Path) -> Result<Vec<Cookie>> {
+    let copy = tmp.join("cookies.sqlite");
+    std::fs::copy(db, &copy).with_context(|| format!("copy {}", db.display()))?;
+    let wal = db.with_file_name("cookies.sqlite-wal");
+    if wal.exists() {
+        std::fs::copy(&wal, tmp.join("cookies.sqlite-wal")).with_context(|| format!("copy {}", wal.display()))?;
+    }
+    let conn = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    // originAttributes = '': the default context only, not Multi-Account Containers or cookies partitioned
+    // under other sites (Total Cookie Protection), which could belong to another account.
     let mut st = conn.prepare(
         "SELECT name, value, host, path, isSecure, expiry FROM moz_cookies
-         WHERE host = 'youtube.com' OR host LIKE '%.youtube.com'",
+         WHERE (host = 'youtube.com' OR host LIKE '%.youtube.com') AND originAttributes = ''
+         ORDER BY lastAccessed DESC",
     )?;
     let rows = st.query_map([], |r| {
         Ok((
@@ -63,15 +83,29 @@ pub fn firefox_youtube() -> Result<Vec<Cookie>> {
             r.get::<_, i64>(5)?,
         ))
     })?;
-    // expiry: seconds in older Firefox, milliseconds in newer versions
-    Ok(rows
-        .flatten()
-        .filter(|(_, exp)| {
-            let exp = if *exp > 100_000_000_000 { exp / 1000 } else { *exp };
-            exp == 0 || exp > now
-        })
-        .map(|(c, _)| c)
-        .collect())
+    let mut out = vec![];
+    for row in rows {
+        let (c, exp) = row.context("cookies.sqlite: unexpected row")?;
+        // expiry: seconds in older Firefox, milliseconds in newer versions
+        let exp = if exp > 100_000_000_000 { exp / 1000 } else { exp };
+        if exp == 0 || exp > now {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Short key of the account and profile: part of the session cache name, so switching accounts or
+/// profiles does not reuse another account's session data.
+pub fn account_key(cookies: &[Cookie], db: &Path) -> String {
+    let mut h = Sha1::new();
+    h.update(db.to_string_lossy().as_bytes());
+    h.update(
+        get(cookies, "SAPISID")
+            .or_else(|| get(cookies, "__Secure-3PAPISID"))
+            .unwrap_or(""),
+    );
+    h.finalize().iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn get<'a>(cookies: &'a [Cookie], name: &str) -> Option<&'a str> {

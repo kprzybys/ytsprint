@@ -67,31 +67,27 @@ fn ejs_for(bin: &Path) -> Option<PathBuf> {
     (out.status.success() && has_solver(&dir)).then_some(dir)
 }
 
-fn cache_file() -> PathBuf {
-    crate::extract::cache_dir().join("ytdlp-location.json")
-}
-
 pub fn yt_dlp() -> Result<YtDlp> {
-    if let Ok(bin) = std::env::var("YTSPRINT_YTDLP") {
-        let bin = PathBuf::from(bin);
-        let ejs_dir = match std::env::var("YTSPRINT_EJS_DIR") {
-            Ok(d) => PathBuf::from(d),
-            Err(_) => ejs_for(&bin).with_context(|| format!("{}: no ejs solver (yt-dlp-ejs)", bin.display()))?,
-        };
-        return Ok(YtDlp { bin, ejs_dir });
-    }
-    let candidates = in_path("yt-dlp");
+    // candidates: $YTSPRINT_YTDLP alone, otherwise every yt-dlp in PATH in order
+    let candidates = match std::env::var("YTSPRINT_YTDLP") {
+        Ok(bin) => vec![PathBuf::from(bin)],
+        Err(_) => in_path("yt-dlp"),
+    };
     let env_ejs = std::env::var("YTSPRINT_EJS_DIR").ok().map(PathBuf::from);
-    // cache: valid while the list of yt-dlp binaries in PATH is unchanged, the chosen one still points
-    // to the same file (a yt-dlp update swaps the symlink to a new version) and the ejs directory exists
-    if let Some(v) = std::fs::read_to_string(cache_file())
+    let cache_file = crate::fsutil::cache_dir()?.join("ytdlp-location.json");
+    // cache: valid while the candidate list is unchanged, the chosen binary still points to the same file
+    // (a yt-dlp update swaps the symlink to a new version) and the ejs directory exists
+    if let Some(v) = std::fs::read_to_string(&cache_file)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
     {
-        let same_path = serde_json::to_value(&candidates).ok().as_ref() == Some(&v["candidates"]);
-        if let (true, Some(bin), Some(ejs), Some(real)) =
-            (same_path, v["bin"].as_str(), v["ejs_dir"].as_str(), v["real"].as_str())
-        {
+        let same_candidates = serde_json::to_value(&candidates).ok().as_ref() == Some(&v["candidates"]);
+        if let (true, Some(bin), Some(ejs), Some(real)) = (
+            same_candidates,
+            v["bin"].as_str(),
+            v["ejs_dir"].as_str(),
+            v["real"].as_str(),
+        ) {
             let same_target = std::fs::canonicalize(bin).ok().as_deref() == Some(Path::new(real));
             if same_target && has_solver(Path::new(ejs)) {
                 return Ok(YtDlp {
@@ -103,11 +99,9 @@ pub fn yt_dlp() -> Result<YtDlp> {
     }
     for bin in &candidates {
         if let Some(ejs) = ejs_for(bin) {
-            let real = std::fs::canonicalize(bin).ok();
-            let _ = std::fs::write(
-                cache_file(),
-                json!({"candidates": candidates, "bin": bin, "real": real, "ejs_dir": ejs}).to_string(),
-            );
+            let real = std::fs::canonicalize(bin).with_context(|| format!("resolve {}", bin.display()))?;
+            let v = json!({"candidates": candidates, "bin": bin, "real": real, "ejs_dir": ejs});
+            crate::fsutil::write_atomic(&cache_file, v.to_string().as_bytes())?;
             return Ok(YtDlp {
                 bin: bin.clone(),
                 ejs_dir: env_ejs.unwrap_or(ejs),
@@ -118,7 +112,7 @@ pub fn yt_dlp() -> Result<YtDlp> {
         bail!("yt-dlp not found in PATH (set YTSPRINT_YTDLP)");
     }
     bail!(
-        "none of the yt-dlp binaries in PATH ships the ejs solver ({}); install a current yt-dlp \
+        "no yt-dlp with the ejs solver ({}); install a current yt-dlp \
          (onedir build or `pip install \"yt-dlp[default]\"`) or set YTSPRINT_EJS_DIR",
         candidates
             .iter()
@@ -126,6 +120,21 @@ pub fn yt_dlp() -> Result<YtDlp> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// yt-dlp for requests ytsprint routes onward (live streams, other sites): the one with ejs when there is one,
+/// otherwise the first in PATH — those requests do not need ytsprint's solver.
+pub fn yt_dlp_for_routing() -> Result<PathBuf> {
+    match yt_dlp() {
+        Ok(y) => Ok(y.bin),
+        Err(e) => {
+            let first = std::env::var("YTSPRINT_YTDLP")
+                .map(PathBuf::from)
+                .ok()
+                .or_else(|| in_path("yt-dlp").into_iter().next());
+            first.with_context(|| format!("no yt-dlp to route to: {e:#}"))
+        }
+    }
 }
 
 /// deno: $YTSPRINT_DENO or the first one in PATH.

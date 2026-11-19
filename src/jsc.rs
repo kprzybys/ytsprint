@@ -1,42 +1,75 @@
 //! n/sig challenges via ytsprint-jsd (src/jsd.js): a long-running deno with the yt-dlp ejs solver and
-//! players loaded in memory. No fallback: when jsd is not running, ytsprint reports an error.
+//! players loaded in memory. jsd has no file access; this client sends it the ejs scripts and the player
+//! when it asks, and stores the prepared player in the cache. No fallback: when jsd is down, it is an error.
 
+use crate::fsutil;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const JSD_SOURCE: &str = include_str!("jsd.js");
+/// Preparing a new player takes ~1.2 s; anything near this limit means jsd is stuck.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())
-}
-
-pub fn socket_path() -> String {
-    std::env::var("YTSPRINT_JSD_SOCKET").unwrap_or_else(|_| format!("{}/ytsprint-jsd.sock", runtime_dir()))
-}
-
-/// Short hash of the ejs scripts: in the cache file name of the prepared player, so that after a yt-dlp update
-/// (new ejs) the player gets prepared again by the new solver instead of using one prepared by the old version.
-pub fn ejs_tag(ejs_dir: &Path) -> Result<String> {
-    use sha1::{Digest, Sha1};
-    let mut h = Sha1::new();
-    for f in ["lib.min.js", "core.min.js"] {
-        let p = ejs_dir.join(f);
-        h.update(std::fs::read(&p).with_context(|| format!("ejs: {}", p.display()))?);
+pub fn socket_path() -> Result<PathBuf> {
+    match std::env::var("YTSPRINT_JSD_SOCKET") {
+        Ok(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => Ok(fsutil::runtime_dir()?.join("ytsprint-jsd.sock")),
     }
-    Ok(h.finalize().iter().take(4).map(|b| format!("{b:02x}")).collect())
+}
+
+pub struct Ejs {
+    pub dir: PathBuf,
+    /// Identifies this ejs version: part of the prepared player's cache name and of jsd's state, so that
+    /// after a yt-dlp update (new ejs) the player is prepared again by the new solver.
+    pub tag: String,
+}
+
+impl Ejs {
+    /// The tag comes from the files' size and mtime (a stat, no hashing on every play).
+    pub fn at(dir: PathBuf) -> Result<Ejs> {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        for f in ["lib.min.js", "core.min.js"] {
+            let p = dir.join(f);
+            let m = std::fs::metadata(&p).with_context(|| format!("ejs: {}", p.display()))?;
+            h.update(format!("{}:{}:{}.{};", p.display(), m.size(), m.mtime(), m.mtime_nsec()).as_bytes());
+        }
+        let tag = h.finalize().iter().take(4).map(|b| format!("{b:02x}")).collect();
+        Ok(Ejs { dir, tag })
+    }
+
+    fn scripts(&self) -> Result<Value> {
+        let read = |f: &str| {
+            let p = self.dir.join(f);
+            std::fs::read_to_string(&p).with_context(|| format!("ejs: {}", p.display()))
+        };
+        Ok(json!({"lib": read("lib.min.js")?, "core": read("core.min.js")?}))
+    }
 }
 
 /// `ytsprint jsd`: starts the service (exec deno with the embedded jsd.js). Run from systemd (ytsprint-jsd.service).
 pub fn run_daemon() -> Result<()> {
-    let script = format!("{}/ytsprint-jsd.js", runtime_dir());
-    std::fs::write(&script, JSD_SOURCE)?;
+    let sock = socket_path()?;
+    let sock_s = sock.to_str().context("socket path is not UTF-8")?;
+    if sock_s.contains(',') {
+        bail!("socket path must not contain ',' (deno permission syntax): {sock_s}");
+    }
+    let script = fsutil::runtime_dir()?.join("ytsprint-jsd.js");
+    fsutil::write_atomic(&script, JSD_SOURCE.as_bytes())?;
+    match std::fs::remove_file(&sock) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove stale {sock_s}")),
+    }
     let deno = crate::locate::deno()?;
-    let sock = socket_path();
+    // access to the socket only: the YouTube player that runs inside jsd cannot touch any file
     let err = Command::new(&deno)
         .args([
             "run",
@@ -45,14 +78,24 @@ pub fn run_daemon() -> Result<()> {
             "--no-lock",
             "--no-npm",
             "--no-remote",
-            "--allow-read",
-            "--allow-write",
         ])
-        .arg(format!("--allow-net=unix:{sock}"))
+        .arg(format!("--allow-net=unix:{sock_s}"))
+        .arg(format!("--allow-read={sock_s}"))
+        .arg(format!("--allow-write={sock_s}"))
         .arg(&script)
-        .arg(&sock)
+        .arg(sock_s)
         .exec();
     bail!("exec {}: {err}", deno.display())
+}
+
+/// Quoting for a systemd unit value: "…" with \ and " escaped, % and $ doubled.
+fn unit_quote(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
 }
 
 /// `ytsprint install-service`: writes ~/.config/systemd/user/ytsprint-jsd.service with absolute paths
@@ -62,9 +105,11 @@ pub fn install_service() -> Result<()> {
     // the path from PATH, not canonicalized: package managers keep it stable across upgrades
     // (Homebrew: .../bin/deno -> Cellar/deno/<version>/...)
     let deno = crate::locate::deno()?;
-    let home = std::env::var("HOME")?;
-    let config = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
-    let dir = PathBuf::from(config).join("systemd/user");
+    let config = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join(".config"),
+    };
+    let dir = config.join("systemd/user");
     std::fs::create_dir_all(&dir)?;
     let unit = dir.join("ytsprint-jsd.service");
     let text = format!(
@@ -72,16 +117,22 @@ pub fn install_service() -> Result<()> {
          [Unit]\n\
          Description=ytsprint-jsd: deno with the YouTube player in memory (n/sig challenges for ytsprint)\n\n\
          [Service]\n\
-         Environment=YTSPRINT_DENO={}\n\
+         Environment={}\n\
          ExecStart={} jsd\n\
          Restart=on-failure\n\
-         RestartSec=2\n\n\
+         RestartSec=2\n\
+         # deno itself only gets the socket (see jsd.js); these limit the process further\n\
+         NoNewPrivileges=yes\n\
+         MemoryMax=1G\n\
+         LockPersonality=yes\n\
+         RestrictRealtime=yes\n\
+         RestrictSUIDSGID=yes\n\n\
          [Install]\n\
          WantedBy=default.target\n",
-        deno.display(),
-        exe.display()
+        unit_quote(&format!("YTSPRINT_DENO={}", deno.display())),
+        unit_quote(&exe.display().to_string()),
     );
-    std::fs::write(&unit, text)?;
+    fsutil::write_atomic(&unit, text.as_bytes())?;
     for args in [
         &["--user", "daemon-reload"][..],
         &["--user", "enable", "--now", "ytsprint-jsd"],
@@ -101,34 +152,81 @@ pub fn install_service() -> Result<()> {
     Ok(())
 }
 
-/// `raw`: raw base.js when the player has not been prepared yet (jsd prepares it and writes `pre_path`).
-pub fn solve(
-    ejs_dir: &Path,
-    player_id: &str,
-    pre_path: &Path,
-    raw: Option<&str>,
-    requests: &[Value],
-) -> Result<Vec<Value>> {
-    let mut req = json!({"ejs_dir": ejs_dir, "player_id": player_id, "pre_path": pre_path, "requests": requests});
-    if let Some(raw) = raw {
-        let raw_path = pre_path.with_extension("raw.js");
-        std::fs::write(&raw_path, raw)?;
-        req["raw_path"] = json!(raw_path);
-    }
-    let sock = socket_path();
-    let mut conn = UnixStream::connect(&sock)
-        .with_context(|| format!("ytsprint-jsd is not running ({sock}); systemctl --user status ytsprint-jsd"))?;
-    conn.write_all(format!("{req}\n").as_bytes())?;
+pub struct Player<'a> {
+    pub id: &'a str,
+    pub ejs: &'a Ejs,
+    /// prepared player in the cache (written here after jsd prepares a raw one)
+    pub pre_path: &'a Path,
+    /// raw base.js when there is no prepared player yet
+    pub raw: Option<&'a str>,
+}
+
+fn exchange(sock: &Path, req: &Value) -> Result<Value> {
+    let mut conn = UnixStream::connect(sock).with_context(|| {
+        format!(
+            "ytsprint-jsd is not running ({}); systemctl --user status ytsprint-jsd",
+            sock.display()
+        )
+    })?;
+    conn.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    conn.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    conn.write_all(format!("{req}\n").as_bytes())
+        .context("ytsprint-jsd: sending the request")?;
     let mut line = String::new();
     BufReader::new(conn)
         .read_line(&mut line)
-        .context("ytsprint-jsd: no response")?;
-    if raw.is_some() {
-        let _ = std::fs::remove_file(pre_path.with_extension("raw.js"));
+        .context("ytsprint-jsd: no response (stuck or crashed?)")?;
+    serde_json::from_str(&line).context("ytsprint-jsd: invalid response")
+}
+
+/// Solves the requests. The first message is small; ejs and the player are sent only when jsd asks
+/// for them (after a restart, a new player or a new ejs) — that is protocol, not a retry.
+pub fn solve(p: &Player, requests: &[Value]) -> Result<Vec<Value>> {
+    let sock = socket_path()?;
+    let mut req = json!({
+        "player_key": format!("{}-ejs{}", p.id, p.ejs.tag),
+        "ejs_tag": p.ejs.tag,
+        "requests": requests,
+    });
+    if let Some(raw) = p.raw {
+        req["raw"] = json!(raw);
     }
-    let v: Value = serde_json::from_str(&line).context("ytsprint-jsd: invalid response")?;
-    if v["type"] == "error" {
-        bail!("ytsprint-jsd: {}", v["error"].as_str().unwrap_or("?"));
+    let mut v = exchange(&sock, &req)?;
+    if v["type"] == "need" {
+        for what in v["what"].as_array().context("ytsprint-jsd: bad 'need'")? {
+            match what.as_str() {
+                Some("ejs") => req["ejs"] = p.ejs.scripts()?,
+                Some("player") => {
+                    let pre = std::fs::read_to_string(p.pre_path)
+                        .with_context(|| format!("prepared player {}", p.pre_path.display()))?;
+                    req["pre"] = json!(pre);
+                }
+                other => bail!("ytsprint-jsd asks for unknown {other:?}"),
+            }
+        }
+        v = exchange(&sock, &req)?;
+    }
+    match v["type"].as_str() {
+        Some("result") => {}
+        Some("error") if v["kind"] == "bad_prepared" => {
+            // a damaged cache file would fail every play: remove it so the next run prepares it again
+            let removed = std::fs::remove_file(p.pre_path).is_ok();
+            bail!(
+                "ytsprint-jsd: {} ({}; {})",
+                v["error"].as_str().unwrap_or("?"),
+                p.pre_path.display(),
+                if removed {
+                    "removed, the next play prepares it again"
+                } else {
+                    "could not remove it"
+                }
+            );
+        }
+        Some("error") => bail!("ytsprint-jsd: {}", v["error"].as_str().unwrap_or("?")),
+        _ => bail!("ytsprint-jsd: unexpected response {}", v["type"]),
+    }
+    if let Some(pre) = v["preprocessed_player"].as_str() {
+        fsutil::write_atomic(p.pre_path, pre.as_bytes())?;
     }
     v["responses"]
         .as_array()
@@ -139,4 +237,15 @@ pub fn solve(
             _ => Err(anyhow!("ejs: {}", r["error"].as_str().unwrap_or("?"))),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_values_are_quoted() {
+        assert_eq!(unit_quote("/a b/x"), "\"/a b/x\"");
+        assert_eq!(unit_quote("50%$\"\\"), "\"50%%$$\\\"\\\\\"");
+    }
 }

@@ -2,7 +2,8 @@
 //! The parser walks the response recursively and collects video entries and continuation tokens,
 //! so it does not depend on the exact page layout (it changes more often than the renderers do).
 
-use crate::extract::{self, Ctx, WEB_UA};
+use crate::extract::{Ctx, WEB_UA};
+use crate::fsutil;
 use anyhow::Result;
 use serde_json::{Value, json};
 
@@ -12,6 +13,7 @@ const WEB_CLIENT_VERSION: &str = "2.20260708.00.00";
 // yt-dlp _search.py: videos only
 const SEARCH_VIDEOS: &str = "EgIQAfABAQ==";
 const MAX_PLAYLIST: usize = 5000;
+const MAX_SEARCH_PAGES: usize = 10;
 
 pub struct Entry {
     pub id: String,
@@ -28,11 +30,12 @@ fn post(ctx: &Ctx, endpoint: &str, mut body: Value) -> Result<Value> {
     ctx.post(endpoint, WEB_UA, WEB_CLIENT_ID, WEB_CLIENT_VERSION, &body)
 }
 
-/// No retry (the error is meant to be visible); after an error the next run starts with a fresh session.
+/// No retry (the error is meant to be visible); after a session error the next run starts with a fresh session.
 fn with_ctx<T>(use_cookies: bool, page: &str, f: impl Fn(&Ctx) -> Result<T>) -> Result<T> {
-    let r = Ctx::new(use_cookies, false, page).and_then(|c| f(&c));
-    if r.is_err() {
-        let _ = std::fs::remove_file(extract::session_file(use_cookies));
+    let ctx = Ctx::new(use_cookies, page)?;
+    let r = f(&ctx);
+    if let Err(e) = &r {
+        ctx.drop_session_if_rejected(e);
     }
     r
 }
@@ -43,11 +46,16 @@ pub fn playlist(list_id: &str, use_cookies: bool) -> Result<(String, Vec<Entry>)
         if let Some(alert) = alert(&first) {
             anyhow::bail!("playlist {list_id}: {alert}");
         }
-        let title = first["metadata"]["playlistMetadataRenderer"]["title"]
+        let title = match first["metadata"]["playlistMetadataRenderer"]["title"]
             .as_str()
             .or_else(|| first["header"]["pageHeaderRenderer"]["pageTitle"].as_str())
-            .unwrap_or(list_id)
-            .to_string();
+        {
+            Some(t) => t.to_string(),
+            None => {
+                fsutil::log(&format!("WARN playlist {list_id}: no title in the response"));
+                list_id.to_string()
+            }
+        };
         let mut entries = vec![];
         let mut page = first;
         loop {
@@ -61,6 +69,10 @@ pub fn playlist(list_id: &str, use_cookies: bool) -> Result<(String, Vec<Entry>)
             }
         }
         dedup(&mut entries);
+        if entries.len() >= MAX_PLAYLIST {
+            fsutil::log(&format!("WARN playlist {list_id}: truncated to {MAX_PLAYLIST} entries"));
+            entries.truncate(MAX_PLAYLIST);
+        }
         if entries.is_empty() {
             anyhow::bail!("playlist {list_id}: no entries");
         }
@@ -72,12 +84,16 @@ pub fn search(query: &str, n: usize, use_cookies: bool) -> Result<Vec<Entry>> {
     with_ctx(use_cookies, "/", |ctx| {
         let mut entries = vec![];
         let mut page = post(ctx, "search", json!({"query": query, "params": SEARCH_VIDEOS}))?;
-        loop {
+        for _ in 0..MAX_SEARCH_PAGES {
+            let before = entries.len();
             let mut conts = vec![];
             walk(&page, &mut entries, &mut conts);
             dedup(&mut entries);
+            // stop when there is enough, no next page, or a page that added nothing new
             match conts.pop() {
-                Some(token) if entries.len() < n => page = post(ctx, "search", json!({"continuation": token}))?,
+                Some(token) if entries.len() < n && entries.len() > before => {
+                    page = post(ctx, "search", json!({"continuation": token}))?
+                }
                 _ => break,
             }
         }
@@ -149,6 +165,13 @@ fn find_token(v: &Value) -> Option<String> {
     }
 }
 
+/// Ad containers among the results (their contents look like normal videos).
+fn is_ad_key(k: &str) -> bool {
+    matches!(k, "adSlotRenderer" | "adPlacementRenderer" | "searchPyvRenderer")
+        || k.ends_with("AdLayoutRenderer")
+        || k.starts_with("promoted")
+}
+
 fn walk(v: &Value, out: &mut Vec<Entry>, conts: &mut Vec<String>) {
     match v {
         Value::Object(m) => {
@@ -185,10 +208,7 @@ fn walk(v: &Value, out: &mut Vec<Entry>, conts: &mut Vec<String>) {
                     }
                     "continuationItemRenderer" => conts.extend(find_token(x)),
                     // ads among the results (e.g. inFeedAdLayoutRenderer with a lockupViewModel inside)
-                    k if k.starts_with("ad")
-                        || k.contains("AdLayout")
-                        || k.contains("Pyv")
-                        || k.starts_with("promoted") => {}
+                    k if is_ad_key(k) => {}
                     _ => walk(x, out, conts),
                 }
             }
@@ -229,5 +249,25 @@ mod tests {
             ]
         );
         assert_eq!(conts, ["TOKEN-1"]);
+    }
+
+    #[test]
+    fn ad_keys() {
+        for k in [
+            "adSlotRenderer",
+            "inFeedAdLayoutRenderer",
+            "promotedSparklesWebRenderer",
+            "searchPyvRenderer",
+        ] {
+            assert!(is_ad_key(k), "{k}");
+        }
+        for k in [
+            "adaptiveFormats",
+            "addToPlaylist",
+            "videoRenderer",
+            "itemSectionRenderer",
+        ] {
+            assert!(!is_ad_key(k), "{k}");
+        }
     }
 }

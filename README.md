@@ -26,7 +26,8 @@ You find out immediately when YouTube changes something.
 
 ## Requirements
 
-- **Linux** (Unix socket, systemd user service). Not tested elsewhere.
+- **Linux** (Unix socket, systemd user service, `XDG_RUNTIME_DIR` set — as in any normal login session).
+  Not tested elsewhere.
 - **mpv** (tested with 0.37).
 - **yt-dlp with the ejs solver**: the [onedir release](https://github.com/yt-dlp/yt-dlp/releases)
   or `pip install "yt-dlp[default]"`. ytsprint uses yt-dlp's JS challenge solver and routes live streams to yt-dlp.
@@ -34,7 +35,7 @@ You find out immediately when YouTube changes something.
 - **[deno](https://deno.com)** in `PATH` (runs the solver; the runtime yt-dlp recommends).
 - **Firefox** logged in to YouTube. **YouTube Premium is strongly recommended**: without it YouTube makes
   the stream wait for a pre-roll ad (HTTP 403 for ~5 s); ytsprint waits that time out, so it works, just slower.
-- Rust ≥ 1.88 to build.
+- Rust ≥ 1.88 to build; deno also for `cargo test` (the service is tested with a real deno).
 
 ## Install
 
@@ -52,7 +53,7 @@ mpv profile (`~/.config/mpv/mpv.conf`, profiles at the end of the file):
 [yt]
 profile-desc=YouTube audio via ytsprint
 video=no
-ytdl-format=bestaudio
+ytdl-format=bestaudio/best
 script-opts-append=ytdl_hook-try_ytdl_first=yes
 script-opts-append=ytdl_hook-ytdl_path=/home/<you>/.cargo/bin/ytsprint
 ytdl-raw-options-append=cookies-from-browser=firefox
@@ -79,6 +80,8 @@ the same query returns a different list every time. Add `--cookies` if you want 
 4. The `n`/`sig` challenges are solved by **ytsprint-jsd**: a resident deno process running
    [yt-dlp's ejs solver](https://github.com/yt-dlp/ejs) with the YouTube player kept in memory (1–3 ms per video
    instead of ~0.45 s). A new player (every few days) or a new ejs version is prepared once.
+   **Sandboxed:** deno may access its socket and nothing else — the YouTube player code it runs cannot read or
+   write any file. ytsprint sends it the solver scripts and the player over the socket when it asks for them.
 5. The title comes from oEmbed in parallel (the TV client does not return it).
 
 Details: [docs/architecture.md](docs/architecture.md). Background, rejected alternatives and measurements:
@@ -106,7 +109,9 @@ Details: [docs/architecture.md](docs/architecture.md). Background, rejected alte
 | `YTSPRINT_NO_WAIT=1` | `--url`: do not wait for the pre-roll ad |
 | `YTSPRINT_DUMP=<dir>` | save raw API responses (debugging) |
 
-Files: cache in `~/.cache/ytsprint/`, log (timings, `ERROR`, routing to yt-dlp) in `~/.local/state/ytsprint/log`.
+Files: cache in `~/.cache/ytsprint/`, log (timings, `ERROR`, `WARN`, routing to yt-dlp) in
+`~/.local/state/ytsprint/log` (rotated at 1 MiB). Both directories are 0700 and the files 0600: the cache holds
+account session data.
 
 ## Disclaimer
 

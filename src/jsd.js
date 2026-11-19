@@ -1,29 +1,34 @@
 // ytsprint-jsd: a long-running deno process that keeps YouTube players loaded in memory.
 // It saves ~0.45 s per play (process start + ~300 ms loading the 4 MB player).
-// The ejs solver (yt-dlp) prepares the player once; after that only the extracted n/sig functions run.
 //
-// Protocol (Unix socket, one JSON line each way):
-//   -> {"ejs_dir", "player_id", "pre_path", "raw_path"?, "requests": [{"type": "n"|"sig", "challenges": [...]}]}
-//   <- {"type": "result", "responses": [...]} | {"type": "error", "error": "..."}
-// raw_path: the player has not been prepared yet; jsd prepares it and writes pre_path (cache for later).
+// Sandbox: deno runs with access to its socket only (no other file, no network, no subprocesses).
+// The YouTube player is remote code; here it cannot read or write any file. Everything it needs —
+// the ejs solver scripts and the player — arrives over the socket, and only when jsd asks for it.
+//
+// Protocol (Unix socket, one JSON line each way; one request per connection):
+//   -> {"player_key": "<player id>-ejs<tag>", "ejs_tag": "<tag>", "requests": [{"type": "n"|"sig", "challenges": [...]}],
+//       "ejs"?: {"lib": "...", "core": "..."}, "raw"?: "<base.js>", "pre"?: "<prepared player>"}
+//   <- {"type": "need", "what": ["ejs"?, "player"?]}           send the request again with these fields
+//    | {"type": "result", "responses": [...], "preprocessed_player"?: "..."}   (the latter after preparing `raw`)
+//    | {"type": "error", "kind": "bad_prepared" | "ejs" | "protocol", "error": "..."}
 
 const SOCK = Deno.args[0];
 const MAX_PLAYERS = 2;
+const CONN_DEADLINE_MS = 15000;
+const KEY_RE = /^[0-9a-f]{8,16}-ejs[0-9a-f]{8,40}$/;
+const TAG_RE = /^[0-9a-f]{8,40}$/;
 
-// ejs comes with yt-dlp; the client says where it is (ytsprint finds it). Reloaded after a change.
-let ejsKey = "";
-function loadEjs(dir) {
-  const m = Math.max(...["lib.min.js", "core.min.js"].map((f) => Deno.statSync(`${dir}/${f}`).mtime.getTime()));
-  const key = `${dir}@${m}`;
-  if (key === ejsKey) return;
-  const lib = Deno.readTextFileSync(`${dir}/lib.min.js`);
-  const core = Deno.readTextFileSync(`${dir}/core.min.js`);
-  (0, eval)(`${lib}\nObject.assign(globalThis, lib);\n${core}\nglobalThis.jsc = jsc;`);
-  ejsKey = key;
-  players.clear(); // a new ejs version may prepare players differently
+let ejsTag = "";
+let jsc = null;
+const players = new Map(); // player_key -> {s: {n, sig}, pre: prepared source (returned when a client lost its copy)}
+
+function loadEjs(tag, ejs) {
+  // the ejs scripts define `var jsc` (and `lib`) at top level; indirect eval = global scope
+  (0, eval)(`${ejs.lib}\nObject.assign(globalThis, lib);\n${ejs.core}\nglobalThis.__ytsprint_jsc = jsc;`);
+  jsc = globalThis.__ytsprint_jsc;
+  ejsTag = tag;
+  players.clear(); // players prepared by another ejs version are not reused
 }
-
-const players = new Map(); // pre_path (player id + ejs version) -> {n, sig}
 
 // ejs-internal (yt-dlp/ejs solvers.ts getFromPrepared): the prepared player sets _result.n/_result.sig.
 function loadPrepared(pre) {
@@ -32,33 +37,43 @@ function loadPrepared(pre) {
   return r;
 }
 
-function solvers(req) {
-  // raw_path = ytsprint has no prepared file: always prepare and write it (otherwise ytsprint would fetch base.js every time)
-  let s = req.raw_path ? null : players.get(req.pre_path);
-  if (s) return s;
-  let pre;
-  if (req.raw_path) {
-    const out = globalThis.jsc({
-      type: "player",
-      player: Deno.readTextFileSync(req.raw_path),
-      requests: [],
-      output_preprocessed: true,
-    });
-    if (out.type !== "result" || !out.preprocessed_player) throw new Error(`ejs: ${out.error ?? "no preprocessed_player"}`);
-    pre = out.preprocessed_player;
-    Deno.writeTextFileSync(req.pre_path, pre);
-  } else {
-    pre = Deno.readTextFileSync(req.pre_path);
-  }
-  s = loadPrepared(pre);
-  if (players.size >= MAX_PLAYERS) players.delete(players.keys().next().value);
-  players.set(req.pre_path, s);
-  return s;
-}
-
 function handle(req) {
-  loadEjs(req.ejs_dir);
-  const s = solvers(req);
+  if (typeof req.player_key !== "string" || !KEY_RE.test(req.player_key)) {
+    return { type: "error", kind: "protocol", error: `bad player_key: ${req.player_key}` };
+  }
+  if (typeof req.ejs_tag !== "string" || !TAG_RE.test(req.ejs_tag) || !Array.isArray(req.requests)) {
+    return { type: "error", kind: "protocol", error: "bad ejs_tag or requests" };
+  }
+  const need = [];
+  if (ejsTag !== req.ejs_tag && !req.ejs) need.push("ejs");
+  const known = ejsTag === req.ejs_tag && players.has(req.player_key);
+  if (!known && !req.raw && !req.pre) need.push("player");
+  if (need.length) return { type: "need", what: need };
+
+  if (ejsTag !== req.ejs_tag) loadEjs(req.ejs_tag, req.ejs);
+
+  // `raw` means the client has no prepared copy (new player or a deleted cache file): it gets one back
+  let entry = players.get(req.player_key);
+  let s = entry?.s;
+  let prepared = req.raw && entry ? entry.pre : undefined;
+  if (!s) {
+    let pre = req.pre;
+    if (req.raw) {
+      const out = jsc({ type: "player", player: req.raw, requests: [], output_preprocessed: true });
+      if (out.type !== "result" || !out.preprocessed_player) {
+        return { type: "error", kind: "ejs", error: `ejs: ${out.error ?? "no preprocessed_player"}` };
+      }
+      pre = prepared = out.preprocessed_player;
+    }
+    try {
+      s = loadPrepared(pre);
+    } catch (e) {
+      return { type: "error", kind: req.raw ? "ejs" : "bad_prepared", error: `loading the prepared player: ${e}` };
+    }
+    if (players.size >= MAX_PLAYERS) players.delete(players.keys().next().value);
+    players.set(req.player_key, { s, pre });
+  }
+
   const responses = req.requests.map((r) => {
     const f = s[r.type];
     if (!f) return { type: "error", error: `Failed to extract ${r.type} function` };
@@ -68,34 +83,42 @@ function handle(req) {
       return { type: "error", error: `${e}` };
     }
   });
-  return { type: "result", responses };
+  const out = { type: "result", responses };
+  if (prepared) out.preprocessed_player = prepared;
+  return out;
 }
 
-try { Deno.removeSync(SOCK); } catch { /* none */ }
-const listener = Deno.listen({ transport: "unix", path: SOCK });
-console.error(`ytsprint-jsd: listening on ${SOCK}`);
-
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-for await (const conn of listener) {
-  // requests one at a time: jsd is meant for a single user, a request takes ~1 ms
-  let buf = "";
-  const chunk = new Uint8Array(65536);
+async function serve(conn) {
+  // a client that never finishes its request must not hold the connection forever
+  const deadline = setTimeout(() => {
+    try { conn.close(); } catch { /* closed */ }
+  }, CONN_DEADLINE_MS);
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  const chunk = new Uint8Array(1 << 16);
+  const parts = [];
   let out;
   try {
     for (;;) {
       const n = await conn.read(chunk);
       if (n === null) break;
-      buf += dec.decode(chunk.subarray(0, n), { stream: true });
-      if (buf.includes("\n")) break;
+      const text = dec.decode(chunk.subarray(0, n), { stream: true });
+      parts.push(text);
+      if (text.includes("\n")) break;
     }
-    out = handle(JSON.parse(buf));
+    out = handle(JSON.parse(parts.join("")));
   } catch (e) {
-    out = { type: "error", error: e instanceof Error ? `${e.message}\n${e.stack}` : `${e}` };
+    out = { type: "error", kind: "protocol", error: e instanceof Error ? `${e.message}\n${e.stack}` : `${e}` };
   }
   try {
     const data = enc.encode(JSON.stringify(out) + "\n");
     for (let off = 0; off < data.length;) off += await conn.write(data.subarray(off));
   } catch { /* client gone */ }
-  conn.close();
+  clearTimeout(deadline);
+  try { conn.close(); } catch { /* closed by the deadline */ }
 }
+
+const listener = Deno.listen({ transport: "unix", path: SOCK });
+console.error(`ytsprint-jsd: listening on ${SOCK}`);
+// connections are served concurrently; handle() itself is synchronous, so state changes do not interleave
+for await (const conn of listener) serve(conn);

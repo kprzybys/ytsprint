@@ -61,6 +61,14 @@ the challenge drops from ~0.45 s to 1–3 ms.
 
 ytsprint-jsd uses ~110 MB RSS (~300 MB briefly while preparing a new player).
 
+## Security
+
+The YouTube player is remote JavaScript. ytsprint-jsd runs it in deno with access to its own socket only
+(no files, no network, no subprocesses); the solver scripts and the player arrive over the socket. Requests are
+validated (`player_key`/`ejs_tag` are hex), the socket lives in `$XDG_RUNTIME_DIR` (0700, required — no `/tmp`
+fallback), and the cache and log are 0600 in 0700 directories. Cookies are read from a private copy of the
+Firefox database and sent only to `www.youtube.com`.
+
 ## Error policy
 
 Errors on the handled path are reported, never masked: no fallback to yt-dlp, no automatic retry, no second JS
