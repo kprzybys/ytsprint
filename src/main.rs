@@ -216,7 +216,7 @@ fn native_video(id: &str, cookies: bool) -> Result<()> {
             "Sec-Fetch-Mode": "navigate",
         },
     });
-    // mpv ignores available_at, so we wait ourselves (with Premium cookies there is no ad: available_at = 0).
+    // mpv ignores available_at, so we wait ourselves (with a Premium account there is no ad: available_at = 0).
     wait_until(a.available_at);
     println!("{out}");
     state_log(&format!(

@@ -1,5 +1,5 @@
 //! Video ID → bestaudio. Path: session (cached; from a YouTube page) → player JS (sts, cached)
-//! → /youtubei/v1/player as `tv_samsung` → n/sig challenges via ytsprint-jsd (jsc.rs).
+//! → /youtubei/v1/player as `web_creator` (Premium) or `tv_samsung` → n/sig challenges via ytsprint-jsd (jsc.rs).
 
 use crate::cookies::{self, Cookie};
 use crate::fsutil;
@@ -22,7 +22,16 @@ const TV_UA: &str =
 const TV_CLIENT_NAME: &str = "TVHTML5";
 const TV_CLIENT_ID: &str = "7";
 const TV_CLIENT_VERSION: &str = "5.20260707";
+// Client definition copied from yt-dlp 2026.11.23 (_base.py, 'web_creator'). Only for Premium accounts: without
+// Premium its streams need a PO token. tv_samsung is not used for them, because it shows a pre-roll ad (and the
+// stream is 403 until it ends) on some videos even with Premium.
+const CREATOR_CLIENT_NAME: &str = "WEB_CREATOR";
+const CREATOR_CLIENT_ID: &str = "62";
+const CREATOR_CLIENT_VERSION: &str = "1.20260708.06.00";
 const ORIGIN: &str = "https://www.youtube.com";
+/// Player variant `tv`, as in yt-dlp 2026.11.23 (`_DEFAULT_PLAYER_JS_VARIANT`): ejs 0.8.0 fails on the `main`
+/// variant since player b485e332 (`addOnDisposeCallback is not a function`, yt-dlp/ejs#79).
+const PLAYER_JS_PATH: &str = "tv-player-ias.vflset/tv-player-ias.js";
 /// A pre-roll wait longer than this is treated as an error rather than a silent long sleep.
 const MAX_PREROLL_WAIT_SECS: f64 = 60.0;
 const TITLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -131,19 +140,29 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
         })
     };
 
-    // Player API as tv_samsung (+ account headers).
-    let body = json!({
-        "context": {"client": {
+    // Player API (+ account headers).
+    let (ua, client_id, client_version, client) = if ctx.sess.premium {
+        let client = json!({
+            "clientName": CREATOR_CLIENT_NAME, "clientVersion": CREATOR_CLIENT_VERSION,
+            "hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0
+        });
+        (WEB_UA, CREATOR_CLIENT_ID, CREATOR_CLIENT_VERSION, client)
+    } else {
+        let client = json!({
             "clientName": TV_CLIENT_NAME, "clientVersion": TV_CLIENT_VERSION,
             "deviceMake": "Samsung", "deviceModel": "UKS9800", "userAgent": TV_UA,
             "osName": "Tizen", "osVersion": "2.4.0", "hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0
-        }},
+        });
+        (TV_UA, TV_CLIENT_ID, TV_CLIENT_VERSION, client)
+    };
+    let body = json!({
+        "context": {"client": client},
         "videoId": video_id,
         "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS", "signatureTimestamp": player.sts}},
         "contentCheckOk": true, "racyCheckOk": true
     });
     let requested_at = now_unix();
-    let resp = ctx.post("player", TV_UA, TV_CLIENT_ID, TV_CLIENT_VERSION, &body)?;
+    let resp = ctx.post("player", ua, client_id, client_version, &body)?;
     let status = resp["playabilityStatus"]["status"].as_str().unwrap_or("?");
     if status != "OK" {
         bail!("playabilityStatus {status}: {}", resp["playabilityStatus"]["reason"]);
@@ -478,6 +497,8 @@ pub struct Session {
     session_index: Option<String>,
     delegated: Option<String>,
     user_session: Option<String>,
+    /// YouTube Premium account (decides the player client)
+    premium: bool,
     pub from_cache: bool,
 }
 
@@ -489,7 +510,8 @@ fn session(http: &Client, file: &std::path::Path, page: &str, use_cookies: bool)
         // a clock set back or a broken value: treat as expired
         let age = (now_unix() as u64).checked_sub(v["saved_at"].as_u64().unwrap_or(0));
         let s = |k: &str| v[k].as_str().map(str::to_string);
-        if let (Some(age), Some(visitor), Some(player_id)) = (age, s("visitor"), s("player_id"))
+        if let (Some(age), Some(visitor), Some(player_id), Some(premium)) =
+            (age, s("visitor"), s("player_id"), v["premium"].as_bool())
             && age < SESSION_TTL_SECS
         {
             return Ok(Session {
@@ -499,6 +521,7 @@ fn session(http: &Client, file: &std::path::Path, page: &str, use_cookies: bool)
                 session_index: s("session_index"),
                 delegated: s("delegated"),
                 user_session: s("user_session"),
+                premium,
                 from_cache: true,
             });
         }
@@ -541,9 +564,13 @@ fn session(http: &Client, file: &std::path::Path, page: &str, use_cookies: bool)
             anyhow::anyhow!("LOGGED_IN=false despite the cookies (expired login in Firefox?)").context(SessionError),
         );
     }
+    let premium = use_cookies
+        && is_premium(&page_html)
+            .context("no topbarLogoRenderer on the page: cannot tell whether the account has Premium")?;
     let saved = json!({
         "saved_at": now_unix() as u64, "visitor": visitor, "player_id": player_id, "logged_in": logged_in,
         "session_index": session_index, "delegated": delegated, "user_session": user_session,
+        "premium": premium,
     });
     fsutil::write_atomic(file, saved.to_string().as_bytes())?;
     Ok(Session {
@@ -553,8 +580,15 @@ fn session(http: &Client, file: &std::path::Path, page: &str, use_cookies: bool)
         session_index,
         delegated,
         user_session,
+        premium,
         from_cache: false,
     })
+}
+
+/// The page's logo says whether the account has Premium (yt-dlp: _is_premium_subscriber); None = no logo found.
+fn is_premium(page_html: &str) -> Option<bool> {
+    let logo = capture(r#""topbarLogoRenderer":\{(.{0,600}?)"endpoint""#, page_html)?;
+    Some(logo.contains("YOUTUBE_PREMIUM_LOGO") || logo.to_lowercase().contains("premium"))
 }
 
 struct PlayerData {
@@ -580,7 +614,7 @@ fn player(http: &Client, player_id: &str, ejs: &jsc::Ejs) -> Result<PlayerData> 
         });
     }
     let raw = http
-        .get(format!("{ORIGIN}/s/player/{player_id}/player_ias.vflset/en_US/base.js"))
+        .get(format!("{ORIGIN}/s/player/{player_id}/{PLAYER_JS_PATH}"))
         .header("User-Agent", WEB_UA)
         .send()?
         .error_for_status()?
@@ -644,6 +678,19 @@ mod tests {
             {"itag": 251, "mimeType": "audio/webm", "bitrate": 140000}
         ]}});
         assert_eq!(best_audio(&plain).unwrap()["itag"], 251);
+    }
+
+    #[test]
+    fn premium_from_the_logo() {
+        let page = |icon: &str, tip: &str| {
+            format!(
+                r#"{{"topbarLogoRenderer":{{"iconImage":{{"iconType":"{icon}"}},"tooltipText":{{"runs":[{{"text":"{tip}"}}]}},"endpoint":{{}}}}}}"#
+            )
+        };
+        assert_eq!(is_premium(&page("YOUTUBE_PREMIUM_LOGO", "YouTube Home")), Some(true));
+        assert_eq!(is_premium(&page("YOUTUBE_LOGO", "YouTube Premium Home")), Some(true));
+        assert_eq!(is_premium(&page("YOUTUBE_LOGO", "YouTube Home")), Some(false));
+        assert_eq!(is_premium("<html>Premium</html>"), None);
     }
 
     #[test]

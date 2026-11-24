@@ -76,13 +76,14 @@ the same query returns a different list every time. Add `--cookies` if you want 
 
 1. Reads the YouTube cookies from Firefox's `cookies.sqlite` (~10 ms) and signs requests (SAPISIDHASH).
 2. Session data (visitor data, current player ID, account IDs) from a YouTube page, cached for 1 h.
-3. `/youtubei/v1/player` as the `tv_samsung` client — no PO token needed (client definition taken from yt-dlp).
+3. `/youtubei/v1/player` as the `web_creator` client for Premium accounts, `tv_samsung` otherwise — neither needs a
+   PO token in that case (client definitions taken from yt-dlp).
 4. The `n`/`sig` challenges are solved by **ytsprint-jsd**: a resident deno process running
    [yt-dlp's ejs solver](https://github.com/yt-dlp/ejs) with the YouTube player kept in memory (1–3 ms per video
    instead of ~0.45 s). A new player (every few days) or a new ejs version is prepared once.
    **Sandboxed:** deno may access its socket and nothing else — the YouTube player code it runs cannot read or
    write any file. ytsprint sends it the solver scripts and the player over the socket when it asks for them.
-5. The title comes from oEmbed in parallel (the TV client does not return it).
+5. Where the client returns no title (`tv_samsung`), it comes from oEmbed, requested in parallel.
 
 Details: [docs/architecture.md](docs/architecture.md). Background, rejected alternatives and measurements:
 [docs/design.md](docs/design.md).
@@ -93,7 +94,7 @@ Details: [docs/architecture.md](docs/architecture.md). Background, rejected alte
 - **yt-dlp / ejs updates**: automatic — the cache key includes a hash of the ejs scripts and the service reloads them.
 - **deno upgrade**: `systemctl --user restart ytsprint-jsd`.
 - **ytsprint upgrade**: `cargo install ...` again, then `systemctl --user restart ytsprint-jsd`.
-- **YouTube rejects a client** (`tv_samsung` / `web` version): you get an error; the fix is new values from
+- **YouTube rejects a client** (`web_creator` / `tv_samsung` / `web` version): you get an error; the fix is new values from
   yt-dlp's `yt_dlp/extractor/youtube/_base.py`.
 
 ## Environment variables
