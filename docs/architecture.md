@@ -10,7 +10,8 @@
    │  ├─ cookies.rs  Firefox cookies, SAPISIDHASH
    │  ├─ extract.rs  session, player API (web_creator/tv_samsung), format selection, pre-roll wait, caches
    │  ├─ browse.rs   playlists and search (web client), result parser
-   │  ├─ locate.rs   finds yt-dlp (with ejs) and deno without hard-coded paths
+   │  ├─ locate.rs   finds yt-dlp (with ejs) and deno; asks yt-dlp for its settings (ytdlp_probe.py)
+   │  ├─ fsutil.rs   private files, atomic writes, the log
    │  └─ jsc.rs      Unix socket client ──────┐
    │                                          ▼
    │                     ytsprint-jsd (deno, systemd user service, src/jsd.js)
@@ -21,19 +22,24 @@
    └─ live streams / other sites / unknown options ──► exec yt-dlp (same arguments)
 ```
 
-## One play, step by step (~0.25–0.6 s)
+## One play, step by step (~0.2–0.6 s)
 
 | Step | Time | Where |
 |---|---|---|
+| yt-dlp location and settings (player variant, client definitions) | ~0 ms cached, ~0.6 s after a yt-dlp update | `locate.rs` |
 | cookies: `cookies.sqlite` + its `-wal` copied to a private temp dir and read (default container only) | ~10–30 ms | `cookies.rs` |
-| session (visitor data, player ID, account IDs) | 0 ms cached, ~1 s once an hour | `extract.rs` |
+| session (visitor data, player ID, account IDs, Premium or not) | 0 ms cached, ~1 s once an hour | `extract.rs` |
 | `/youtubei/v1/player` as `web_creator` (Premium) or `tv_samsung` | 0.1–0.5 s | `extract.rs` |
-| title from oEmbed, in parallel | 0 ms (background) | `extract.rs` |
+| title from oEmbed, in parallel (`tv_samsung` only) | 0 ms (background) | `extract.rs` |
 | `n` / `sig` challenge | 1–3 ms | `ytsprint-jsd` |
 | JSON for mpv | – | `main.rs` |
 
 Playlists (`/browse VL<id>`, further pages via continuation tokens) and search (`/search`) use the `web` client.
 mpv receives the list of `entries` and opens each video separately through the path above.
+Limits: 5000 entries or 500 pages per playlist (cut with a `WARN`), 10 pages per search; a playlist page that repeats
+is an error. YouTube's error alerts are checked on every page.
+
+Time limits: 5 s to connect and 15 s per HTTP request, 15 s for ytsprint-jsd, 15 s for running yt-dlp or its Python.
 
 ## Key decisions
 
@@ -46,7 +52,7 @@ mpv receives the list of `entries` and opens each video separately through the p
    their updates. The player JS variant is the one that yt-dlp uses (`locate.rs` asks it through a small plugin,
    once per yt-dlp version): ejs may fail on the others. If yt-dlp cannot tell, it is an error — no built-in default.
 3. **Player kept in memory (`ytsprint-jsd`), sandboxed.** Saves ~0.45 s per play (deno start + ~300 ms loading
-   the 4 MB player). deno gets `--allow-net/read/write` for its socket path only, so the remote player code has
+   the player, a few MB). deno gets `--allow-net/read/write` for its socket path only, so the remote player code has
    no file access. Protocol: the client sends a small request (`player_key`, `ejs_tag`, challenges); jsd answers
    `need: ejs/player` when it lacks them (after a restart, a new player or new ejs) and the client resends with
    the scripts / the prepared player / the raw player. A raw player is prepared once and returned, and the client
@@ -63,29 +69,35 @@ mpv receives the list of `entries` and opens each video separately through the p
 6. **Layout-independent result parser.** It looks for renderer types (`playlistVideoRenderer`, `videoRenderer`,
    `lockupViewModel`, `continuationItemRenderer`) anywhere in the response and skips ads.
 7. **Search without the account by default**: with it, results changed on every query (personalisation).
-8. **Title via oEmbed**: the `tv_samsung` client returns none (`web_creator` does); the request runs in parallel (2 s limit).
+8. **Title via oEmbed** for `tv_samsung`, which returns none (`web_creator` does); the request runs in parallel
+   (2 s limit).
 9. **No hard-coded paths**: yt-dlp, ejs and deno are found via `PATH` (`locate.rs`); the systemd unit is
    generated with absolute paths by `install-service`.
 10. **Audio track**: the original/default track is preferred over auto-dubs and DRC variants, then the bitrate.
-11. **Pre-roll wait** (no Premium): announced on stderr and capped at 60 s; longer is an error.
+11. **Pre-roll wait** (no Premium): the ad's length, announced on stderr and capped at 60 s; longer is an error.
+12. **Fixed browser User-Agent (Chrome 147)**, not yt-dlp's random one: with Chrome 152 and newer YouTube breaks off
+    our HTTP/2 connections (see [design.md](design.md#findings)). `tv_samsung` uses its own from yt-dlp.
+13. **mpv's arguments**: only the subset its `ytdl_hook` passes is accepted (`--all-subs` up to mpv 0.39,
+    `--sub-langs all --write-srt` since 0.40); anything else is routed to yt-dlp and logged.
 
 ## Caches and updates
 
 | What changes | What happens |
 |---|---|
-| YouTube player (every few days) | new ID in the session → base.js downloaded → jsd prepares it once (~1.2 s) → `player-*` files deleted, except the previous player's |
-| yt-dlp / ejs | the ejs tag (size + mtime of its files) is part of `player-<id>-ejs<tag>.pre.js` and of jsd's state → jsd asks for the new scripts and the player is prepared again; the yt-dlp location cache is invalidated when the binary points elsewhere |
+| YouTube player (every few days) | new ID in the session → player JS downloaded → jsd prepares it once (~1–3 s) → `player-*` files deleted, except the previous player's |
+| yt-dlp / ejs | the ejs tag (path, size and mtime of its files + the player JS variant) is part of `player-<id>-ejs<tag>.pre.js` and of jsd's state → jsd asks for the new scripts and the player is prepared again; the location cache is invalidated when the binary points elsewhere, the settings cache when the yt-dlp file changes (path, size, mtime; not noticed for an editable git install) |
 | session | valid for 1 h, per account and Firefox profile; dropped after a session-related error |
 | deno | `systemctl --user restart ytsprint-jsd` |
-| ytsprint | `cargo install …` + `systemctl --user restart ytsprint-jsd` |
+| ytsprint | `cargo install …` + `ytsprint install-service` (rewrites the unit, restarts the service) |
 | YouTube rejects a client | error in mpv and `ERROR` in the log → yt-dlp update (the definitions are read from it) |
 
 ## Files
 
 | Path | Contents |
 |---|---|
-| `~/.cache/ytsprint/` (0700, files 0600) | `session-<account>.json` (1 h), `player-<id>.sts`, `player-<id>-ejs<tag>.pre.js`, `ytdlp-location.json` |
-| `~/.local/state/ytsprint/log` (0600, rotated at 1 MiB) | timings per step, `ERROR`, `WARN`, routing to yt-dlp |
+| `~/.cache/ytsprint/` (0700, files 0600) | `session-<account>.json` (1 h), `player-<id>.sts`, `player-<id>-ejs<tag>.pre.js`, `ytdlp-location.json`, `ytdlp-settings.json`, `ytdlp-plugin/` (the probe) |
+| `~/.local/state/ytsprint/log` (0600, rotated to `log.1` at 1 MiB) | video and playlist IDs, arguments of routed requests, timings per step, `ERROR`, `WARN`, routing to yt-dlp |
 | `$XDG_RUNTIME_DIR/ytsprint-jsd.sock` | service socket |
+| `$XDG_RUNTIME_DIR/ytsprint-cookies-<pid>/` (0700) | copy of the Firefox cookie database, removed right after reading |
 | `$XDG_RUNTIME_DIR/ytsprint-jsd.js` | the service script (embedded in the binary, written on start) |
 | `~/.config/systemd/user/ytsprint-jsd.service` | generated by `ytsprint install-service` |

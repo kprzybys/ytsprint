@@ -15,15 +15,21 @@ PO tokens, SABR.
 
 - **yt-dlp needs no PO token for this.** Its default `tv_samsung` client (`TVHTML5`) returns stream URLs that work
   once the `n`/`sig` JS challenges from the player's `base.js` are solved. Clients such as `web`, `ios` and
-  `android_vr` need a PO token.
-- **The pre-roll ad.** Without Premium, the stream returns 403 for ~5 s after the player request, until the ad
+  `android_vr` need a PO token; `web_creator` needs one only without Premium.
+- **The pre-roll ad.** Without Premium, the stream returns 403 for a few seconds after the player request, until the ad
   "has played" (yt-dlp exposes it as `available_at`). mpv's `ytdl_hook` ignores `available_at`, so with plain
   yt-dlp mpv sometimes fails with `EDL: Could not open source file`. With Premium cookies there is no ad
   in `web_creator`; `tv_samsung` still had one on 6 of 12 tested videos (403 for 3–4 s, always the same videos).
 - **Player variant `tv`.** Since player b485e332 (November 2026) ejs 0.8.0 fails on the `main` variant
   (`addOnDisposeCallback is not a function`, yt-dlp/ejs#79); yt-dlp 2026.11.23 switched to `tv`.
   ytsprint asks the installed yt-dlp which variant it uses, so such a switch arrives with the yt-dlp update.
-- Stream URLs from `tv_samsung` are fetched with a desktop Chrome User-Agent (what yt-dlp puts in `http_headers`).
+- Stream URLs are fetched with a desktop Chrome User-Agent (what yt-dlp puts in `http_headers`).
+- **Chrome version in the User-Agent.** With reqwest 0.13/rustls, YouTube breaks off the HTTP/2 connection when the
+  User-Agent says Chrome 152–157; 145–151 work (two runs each). curl works with 152, so it is the combination with
+  our HTTP client; the exact cause is unknown. yt-dlp 2026.11.23 draws a random version from 151–157, so its
+  User-Agent cannot simply be reused.
+- **mpv 0.40** replaced `--all-subs` with `--sub-langs all --write-srt` in `ytdl_hook`; an argument parser that does
+  not know them routes everything to yt-dlp.
 - The `tv_samsung` player response has no title → oEmbed.
 - SAPISIDHASH with a user session ID ends in the literal `u`: yt-dlp builds it with `''.join(dict)`, which joins
   the dict's keys.
@@ -58,12 +64,12 @@ the challenge drops from ~0.45 s to 1–3 ms.
 
 | | yt-dlp | ytsprint |
 |---|---|---|
-| single video, to stream URL (Premium) | ~5.5 s | 0.25–0.6 s warm, ~1–3 s first of the hour |
-| liked videos (list) | 1.7 s | 0.4 s |
-| search, 15 results | 1.8 s | 0.6 s |
+| single video, to stream URL (Premium) | ~5.5 s | 0.2–0.6 s warm, ~1–2 s first of the hour, ~3–5 s with an empty cache |
+| liked videos (list) | 1.7 s | 0.4–0.5 s |
+| search, 15 results | 1.8 s | 0.6–1.1 s |
 | cookie extraction | ~1.6 s | ~10 ms |
 
-ytsprint-jsd uses ~110 MB RSS (~300 MB briefly while preparing a new player).
+ytsprint-jsd uses ~90–110 MB RSS (~300 MB briefly while preparing a new player).
 
 ## Security
 
@@ -71,12 +77,18 @@ The YouTube player is remote JavaScript. ytsprint-jsd runs it in deno with acces
 (no files, no network, no subprocesses); the solver scripts and the player arrive over the socket. Requests are
 validated (`player_key`/`ejs_tag` are hex), the socket lives in `$XDG_RUNTIME_DIR` (0700, required — no `/tmp`
 fallback), and the cache and log are 0600 in 0700 directories. Cookies are read from a private copy of the
-Firefox database and sent only to `www.youtube.com`.
+Firefox database and sent by ytsprint only to `www.youtube.com` (for routed requests yt-dlp reads them itself).
+
+What the sandbox does not prevent: player code shares the process with the solver, so it can end it or loop forever.
+Then that play fails, and the service is started again (by systemd, or by the client after the 15 s timeout).
+
+The installed yt-dlp is trusted: ytsprint runs it, once per version with its own probe plugin and no other plugins.
 
 ## Error policy
 
 Errors on the handled path are reported, never masked: no fallback to yt-dlp, no automatic retry, no second JS
-runtime. After an error the cached session is dropped so the next run starts fresh. Routing cases ytsprint does
+runtime. After a session-related error (HTTP 4xx, logged out, unexpected page) the cached session is dropped so the
+next run starts fresh; a stuck ytsprint-jsd is restarted, but the failed request is not repeated. Routing cases ytsprint does
 not implement (live streams, other sites) to yt-dlp is deliberate and logged as such, not as an error.
 
 ## Upstream changes to watch
@@ -84,7 +96,8 @@ not implement (live streams, other sites) to yt-dlp is deliberate and logged as 
 Rate of change in yt-dlp over the year before November 2026: 73 commits in `yt_dlp/extractor/youtube`,
 21 in `_base.py` (client definitions); ejs 0.1 → 0.8 in 11 releases. The changes relevant here are client
 definitions (`web_creator`, `tv_samsung`, `web`), the names the probe reads (`_DEFAULT_PLAYER_JS_VARIANT`,
-`_PLAYER_JS_VARIANT_MAP`) and the ejs internals that `jsd.js` relies on.
+`_PLAYER_JS_VARIANT_MAP`, `INNERTUBE_CLIENTS`) and the ejs internals that `jsd.js` relies on. Outside yt-dlp: the
+arguments mpv's `ytdl_hook` passes, the Premium logo on YouTube pages, the Firefox profile location.
 
 ## Possible next steps
 

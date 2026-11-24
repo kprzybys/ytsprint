@@ -5,7 +5,7 @@
 //!
 //!   ytsprint <yt-dlp arguments>          as called by mpv: JSON on stdout or exec yt-dlp
 //!   ytsprint --url <id|URL> [--cookies]  debugging: the stream URL + timings on stderr
-//!   ytsprint search <N> <query>          search: lines "id<TAB>duration_s<TAB>title" (for fzf in `yt`)
+//!   ytsprint search <N> <query>          search: lines "id<TAB>duration_s<TAB>title" (e.g. for fzf)
 //!   ytsprint jsd                          ytsprint-jsd service: deno with the ejs solver and players in memory
 //!   ytsprint install-service              writes and enables the systemd user unit for ytsprint-jsd
 
@@ -308,8 +308,7 @@ fn search(args: &[String]) -> Result<()> {
     let (Some(n), Some(query)) = (args.get(1).and_then(|n| n.parse().ok()), args.get(2)) else {
         bail!("usage: ytsprint search <N> <query> [--cookies]")
     };
-    // Without the account by default: results with the account vary a lot from run to run (personalisation),
-    // and before ytsprint, `yt` searched without the account too.
+    // Without the account by default: results with the account vary a lot from run to run (personalisation).
     let cookies = args.iter().any(|a| a == "--cookies");
     let t = Instant::now();
     let entries = browse::search(query, n, cookies)?;
