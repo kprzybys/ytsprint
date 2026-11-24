@@ -129,6 +129,7 @@ Look at `~/.local/state/ytsprint/log` and `systemctl --user status ytsprint-jsd`
 | `waiting N s for the pre-roll ad` | no Premium in the cookies, or no `cookies-from-browser` in the mpv profile |
 | slow start, `yt-dlp (arguments not handled)` in the log | mpv passed an option ytsprint does not know, e.g. another `ytdl-format` or a subtitle language |
 | `playabilityStatus …` | YouTube's own reason (private, removed, region) |
+| `playabilityStatus ERROR: "This video is restricted…"` (often only live streams) | your network forces YouTube's Restricted Mode, usually through DNS: `getent ahostsv4 www.youtube.com` shows `216.239.38.119` or `216.239.38.120`; change it there |
 
 ## Environment variables
 
