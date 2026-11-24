@@ -28,19 +28,19 @@ You find out immediately when YouTube changes something.
 
 - **Linux** (Unix socket, systemd user service, `XDG_RUNTIME_DIR` set — as in any normal login session).
   Not tested elsewhere.
-- **mpv** (tested with 0.37).
+- **mpv** (tested with 0.37 and 0.40).
 - **yt-dlp with the ejs solver**: the [onedir release](https://github.com/yt-dlp/yt-dlp/releases)
   or `pip install "yt-dlp[default]"`. ytsprint uses yt-dlp's JS challenge solver and routes live streams to yt-dlp.
   Old distribution packages without `yt-dlp-ejs` are skipped; ytsprint uses the first `yt-dlp` in `PATH` that has it.
 - **[deno](https://deno.com)** in `PATH` (runs the solver; the runtime yt-dlp recommends).
 - **Firefox** logged in to YouTube. **YouTube Premium is strongly recommended**: without it YouTube makes
   the stream wait for a pre-roll ad (HTTP 403 for ~5 s); ytsprint waits that time out, so it works, just slower.
-- Rust ≥ 1.88 to build; deno also for `cargo test` (the service is tested with a real deno).
+- Rust ≥ 1.89 to build; deno also for `cargo test` (the service is tested with a real deno).
 
 ## Install
 
 ```sh
-cargo install --git https://github.com/kprzybys/ytsprint
+cargo install --locked --git https://github.com/kprzybys/ytsprint
 ytsprint install-service     # writes and enables ~/.config/systemd/user/ytsprint-jsd.service
 ```
 

@@ -105,7 +105,14 @@ fn parse_ytdl_args(args: &[String]) -> Option<Request> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-J" | "--dump-single-json" => json = true,
-            "--no-warnings" | "--flat-playlist" | "--all-subs" => {}
+            // subtitles (audio only: there are none to return): --all-subs up to mpv 0.39,
+            // --sub-langs all --write-srt since mpv 0.40
+            "--no-warnings" | "--flat-playlist" | "--all-subs" | "--write-srt" => {}
+            "--sub-langs" => {
+                if it.next()? != "all" {
+                    return None;
+                }
+            }
             "--no-playlist" => no_playlist = true,
             "--sub-format" => {
                 it.next()?;
@@ -373,7 +380,14 @@ mod tests {
         );
         let r = parse_ytdl_args(&a).unwrap();
         assert!(r.cookies && matches!(r.target, Target::Video(_)));
+        // mpv 0.40 and newer
+        let a = args(
+            "--no-warnings -J --flat-playlist --sub-format ass/srt/best --format bestaudio/best --cookies-from-browser firefox --sub-langs all --write-srt --no-playlist -- https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        );
+        let r = parse_ytdl_args(&a).unwrap();
+        assert!(r.cookies && matches!(r.target, Target::Video(_)));
         // anything else goes to yt-dlp
+        assert!(parse_ytdl_args(&args("-J --format bestaudio --sub-langs en --write-srt -- dQw4w9WgXcQ")).is_none());
         assert!(parse_ytdl_args(&args("-J --format bestvideo -- dQw4w9WgXcQ")).is_none());
         assert!(
             parse_ytdl_args(&args(

@@ -140,7 +140,10 @@ pub fn install_service() -> Result<()> {
         &["--user", "enable", "--now", "ytsprint-jsd"],
         &["--user", "restart", "ytsprint-jsd"],
     ] {
-        let st = Command::new("systemctl").args(args).status()?;
+        let st = Command::new("systemctl")
+            .args(args)
+            .status()
+            .context("run systemctl (the service needs systemd)")?;
         if !st.success() {
             bail!("systemctl {} failed", args.join(" "));
         }

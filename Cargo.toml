@@ -2,7 +2,7 @@
 name = "ytsprint"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Fast YouTube audio for mpv: a drop-in yt-dlp replacement for ytdl_hook (single videos, playlists, search) with YouTube Premium cookies"
 license = "Unlicense"
 repository = "https://github.com/kprzybys/ytsprint"
