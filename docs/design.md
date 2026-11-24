@@ -21,7 +21,8 @@ PO tokens, SABR.
   yt-dlp mpv sometimes fails with `EDL: Could not open source file`. With Premium cookies there is no ad
   in `web_creator`; `tv_samsung` still had one on 6 of 12 tested videos (403 for 3–4 s, always the same videos).
 - **Player variant `tv`.** Since player b485e332 (November 2026) ejs 0.8.0 fails on the `main` variant
-  (`addOnDisposeCallback is not a function`, yt-dlp/ejs#79); yt-dlp 2026.11.23 switched to `tv`, ytsprint too.
+  (`addOnDisposeCallback is not a function`, yt-dlp/ejs#79); yt-dlp 2026.11.23 switched to `tv`.
+  ytsprint asks the installed yt-dlp which variant it uses, so such a switch arrives with the yt-dlp update.
 - Stream URLs from `tv_samsung` are fetched with a desktop Chrome User-Agent (what yt-dlp puts in `http_headers`).
 - The `tv_samsung` player response has no title → oEmbed.
 - SAPISIDHASH with a user session ID ends in the literal `u`: yt-dlp builds it with `''.join(dict)`, which joins
@@ -82,7 +83,8 @@ not implement (live streams, other sites) to yt-dlp is deliberate and logged as 
 
 Rate of change in yt-dlp over the year before November 2026: 73 commits in `yt_dlp/extractor/youtube`,
 21 in `_base.py` (client definitions); ejs 0.1 → 0.8 in 11 releases. The changes relevant here are client
-definitions (`web_creator`, `tv_samsung`, `web`), the default player JS variant and the ejs internals that `jsd.js` relies on.
+definitions (`web_creator`, `tv_samsung`, `web`), the names the probe reads (`_DEFAULT_PLAYER_JS_VARIANT`,
+`_PLAYER_JS_VARIANT_MAP`) and the ejs internals that `jsd.js` relies on.
 
 ## Possible next steps
 

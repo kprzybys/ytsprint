@@ -3,17 +3,99 @@
 //! yt-dlp: $YTSPRINT_YTDLP, otherwise the first `yt-dlp` in PATH that ships ejs — the onedir build
 //! (`_internal/yt_dlp_ejs` next to the binary) or a pip install (the `yt_dlp_ejs` module of the script's interpreter).
 //! ejs: $YTSPRINT_EJS_DIR, otherwise from that yt-dlp. The location is cached (it is checked on every play).
+//! Player JS variant: whatever that yt-dlp uses (asked once per yt-dlp version), because ejs is only known to work
+//! with the variant yt-dlp picks. No built-in default: when yt-dlp cannot tell, it is an error.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const SOLVER_SUBDIR: &str = "yt_dlp_ejs/yt/solver";
+const PROBE_SOURCE: &str = include_str!("ytdlp_probe.py");
+/// Starting yt-dlp takes ~0.6 s (no network); anything near this limit means it is stuck.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct YtDlp {
     pub bin: PathBuf,
     pub ejs_dir: PathBuf,
+}
+
+impl YtDlp {
+    /// Path of the player JS under `/s/player/<id>/`, as this yt-dlp would download it. Cached until the yt-dlp
+    /// file changes: an update swaps the symlink (onedir) or rewrites the script (pip).
+    pub fn player_js(&self) -> Result<String> {
+        let real = std::fs::canonicalize(&self.bin).with_context(|| format!("resolve {}", self.bin.display()))?;
+        let m = std::fs::metadata(&real)?;
+        let id = json!([real, m.size(), m.mtime(), m.mtime_nsec()]);
+        let cache = crate::fsutil::cache_dir()?.join("ytdlp-player-js.json");
+        if let Some(v) = std::fs::read_to_string(&cache)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            && v["ytdlp"] == id
+            && let Some(p) = v["player_js"].as_str()
+        {
+            return Ok(p.to_string());
+        }
+        let path = probe_player_js(&self.bin)?;
+        let v = json!({"ytdlp": id, "player_js": path});
+        crate::fsutil::write_atomic(&cache, v.to_string().as_bytes())?;
+        Ok(path)
+    }
+}
+
+/// Asks yt-dlp itself, through a plugin that prints the setting: the onedir build has no .py files to read.
+fn probe_player_js(bin: &Path) -> Result<String> {
+    let plugins = crate::fsutil::cache_dir()?.join("ytdlp-plugin");
+    let dir = plugins.join("ytsprint/yt_dlp_plugins/extractor");
+    crate::fsutil::private_dir(&dir)?;
+    crate::fsutil::write_atomic(&dir.join("ytsprint_probe.py"), PROBE_SOURCE.as_bytes())?;
+    let mut child = Command::new(bin)
+        .args(["--ignore-config", "--no-plugin-dirs", "--plugin-dirs"])
+        .arg(&plugins)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {}", bin.display()))?;
+    let started = Instant::now();
+    while child.try_wait()?.is_none() {
+        if started.elapsed() > PROBE_TIMEOUT {
+            child.kill()?;
+            child.wait()?;
+            bail!("{}: no answer about the player JS variant", bin.display());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (mut out, mut err) = (String::new(), String::new());
+    if let Some(mut s) = child.stdout.take() {
+        s.read_to_string(&mut out)?;
+    }
+    if let Some(mut s) = child.stderr.take() {
+        s.read_to_string(&mut err)?;
+    }
+    parse_probe(&out).with_context(|| {
+        format!(
+            "{}: cannot read the player JS variant (incompatible yt-dlp?): {}",
+            bin.display(),
+            err.trim().lines().last().unwrap_or("no output")
+        )
+    })
+}
+
+fn parse_probe(out: &str) -> Option<String> {
+    let json = out.lines().find_map(|l| l.strip_prefix("YTSPRINT "))?;
+    let v: Value = serde_json::from_str(json).ok()?;
+    let p = v["player_js"].as_str()?;
+    // it becomes part of a URL
+    let ok = p.ends_with(".js")
+        && !p.starts_with('/')
+        && !p.contains("..")
+        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./".contains(&b));
+    ok.then(|| p.to_string())
 }
 
 /// All executable files named `name` in PATH, in order.
@@ -146,4 +228,20 @@ pub fn deno() -> Result<PathBuf> {
         .into_iter()
         .next()
         .context("deno not found in PATH (set YTSPRINT_DENO)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_output() {
+        let line = |p: &str| format!("noise\nYTSPRINT {{\"player_js\": \"{p}\"}}\n");
+        let tv = "tv-player-ias.vflset/tv-player-ias.js";
+        assert_eq!(parse_probe(&line(tv)).as_deref(), Some(tv));
+        for bad in ["", "../x.js", "/x.js", "x.js?a=1", "x.css"] {
+            assert_eq!(parse_probe(&line(bad)), None, "{bad}");
+        }
+        assert_eq!(parse_probe("yt-dlp: error: You must provide at least one URL."), None);
+    }
 }

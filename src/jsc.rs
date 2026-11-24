@@ -32,10 +32,12 @@ pub struct Ejs {
 }
 
 impl Ejs {
-    /// The tag comes from the files' size and mtime (a stat, no hashing on every play).
-    pub fn at(dir: PathBuf) -> Result<Ejs> {
+    /// The tag comes from the files' size and mtime (a stat, no hashing on every play) and the player JS variant:
+    /// a player prepared from another variant must not be reused.
+    pub fn at(dir: PathBuf, player_js: &str) -> Result<Ejs> {
         use sha1::{Digest, Sha1};
         let mut h = Sha1::new();
+        h.update(format!("{player_js};").as_bytes());
         for f in ["lib.min.js", "core.min.js"] {
             let p = dir.join(f);
             let m = std::fs::metadata(&p).with_context(|| format!("ejs: {}", p.display()))?;

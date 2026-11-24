@@ -29,9 +29,6 @@ const CREATOR_CLIENT_NAME: &str = "WEB_CREATOR";
 const CREATOR_CLIENT_ID: &str = "62";
 const CREATOR_CLIENT_VERSION: &str = "1.20260708.06.00";
 const ORIGIN: &str = "https://www.youtube.com";
-/// Player variant `tv`, as in yt-dlp 2026.11.23 (`_DEFAULT_PLAYER_JS_VARIANT`): ejs 0.8.0 fails on the `main`
-/// variant since player b485e332 (`addOnDisposeCallback is not a function`, yt-dlp/ejs#79).
-const PLAYER_JS_PATH: &str = "tv-player-ias.vflset/tv-player-ias.js";
 /// A pre-roll wait longer than this is treated as an error rather than a silent long sleep.
 const MAX_PREROLL_WAIT_SECS: f64 = 60.0;
 const TITLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -109,8 +106,10 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
         *t = Instant::now();
     };
 
-    let ejs = jsc::Ejs::at(crate::locate::yt_dlp()?.ejs_dir)?;
-    let player = player(&ctx.http, &ctx.sess.player_id, &ejs)?;
+    let ytdlp = crate::locate::yt_dlp()?;
+    let player_js = ytdlp.player_js()?;
+    let ejs = jsc::Ejs::at(ytdlp.ejs_dir, &player_js)?;
+    let player = player(&ctx.http, &ctx.sess.player_id, &player_js, &ejs)?;
     lap(
         if player.raw.is_none() {
             "player (cache)"
@@ -599,7 +598,7 @@ struct PlayerData {
     raw: Option<String>,
 }
 
-fn player(http: &Client, player_id: &str, ejs: &jsc::Ejs) -> Result<PlayerData> {
+fn player(http: &Client, player_id: &str, player_js: &str, ejs: &jsc::Ejs) -> Result<PlayerData> {
     let dir = fsutil::cache_dir()?;
     let sts_file = dir.join(format!("player-{player_id}.sts"));
     let pre_file = dir.join(format!("player-{player_id}-ejs{}.pre.js", ejs.tag));
@@ -614,7 +613,7 @@ fn player(http: &Client, player_id: &str, ejs: &jsc::Ejs) -> Result<PlayerData> 
         });
     }
     let raw = http
-        .get(format!("{ORIGIN}/s/player/{player_id}/{PLAYER_JS_PATH}"))
+        .get(format!("{ORIGIN}/s/player/{player_id}/{player_js}"))
         .header("User-Agent", WEB_UA)
         .send()?
         .error_for_status()?

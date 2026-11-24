@@ -43,7 +43,8 @@ mpv receives the list of `entries` and opens each video separately through the p
    lifts its PO token requirement. `tv_samsung` needs no PO token at all, but has ads without Premium, and on some
    videos even with it. Premium is read from the logo on the session page; a page without it is an error.
 2. **yt-dlp's ejs solver.** The hardest and most fragile part is maintained by the yt-dlp team and arrives with
-   their updates.
+   their updates. The player JS variant is the one that yt-dlp uses (`locate.rs` asks it through a small plugin,
+   once per yt-dlp version): ejs may fail on the others. If yt-dlp cannot tell, it is an error — no built-in default.
 3. **Player kept in memory (`ytsprint-jsd`), sandboxed.** Saves ~0.45 s per play (deno start + ~300 ms loading
    the 4 MB player). deno gets `--allow-net/read/write` for its socket path only, so the remote player code has
    no file access. Protocol: the client sends a small request (`player_key`, `ejs_tag`, challenges); jsd answers

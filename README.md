@@ -91,7 +91,8 @@ Details: [docs/architecture.md](docs/architecture.md). Background, rejected alte
 ## Updates
 
 - **YouTube player changes**: automatic (prepared once, ~1.2 s, old files deleted).
-- **yt-dlp / ejs updates**: automatic — the cache key includes a hash of the ejs scripts and the service reloads them.
+- **yt-dlp / ejs updates**: automatic — a new ejs is reloaded and the new yt-dlp is asked once (~0.6 s, offline) which
+  player JS variant it uses.
 - **deno upgrade**: `systemctl --user restart ytsprint-jsd`.
 - **ytsprint upgrade**: `cargo install ...` again, then `systemctl --user restart ytsprint-jsd`.
 - **YouTube rejects a client** (`web_creator` / `tv_samsung` / `web` version): you get an error; the fix is new values from
