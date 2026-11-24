@@ -77,7 +77,7 @@ the same query returns a different list every time. Add `--cookies` if you want 
 1. Reads the YouTube cookies from Firefox's `cookies.sqlite` (~10 ms) and signs requests (SAPISIDHASH).
 2. Session data (visitor data, current player ID, account IDs) from a YouTube page, cached for 1 h.
 3. `/youtubei/v1/player` as the `web_creator` client for Premium accounts, `tv_samsung` otherwise — neither needs a
-   PO token in that case (client definitions taken from yt-dlp).
+   PO token in that case (client definitions are read from your yt-dlp).
 4. The `n`/`sig` challenges are solved by **ytsprint-jsd**: a resident deno process running
    [yt-dlp's ejs solver](https://github.com/yt-dlp/ejs) with the YouTube player kept in memory (1–3 ms per video
    instead of ~0.45 s). A new player (every few days) or a new ejs version is prepared once.
@@ -91,12 +91,12 @@ Details: [docs/architecture.md](docs/architecture.md). Background, rejected alte
 ## Updates
 
 - **YouTube player changes**: automatic (prepared once, ~1.2 s, old files deleted).
-- **yt-dlp / ejs updates**: automatic — a new ejs is reloaded and the new yt-dlp is asked once (~0.6 s, offline) which
-  player JS variant it uses.
+- **yt-dlp / ejs updates**: automatic — a new ejs is reloaded and the new yt-dlp is asked once (~0.6 s, offline) for its
+  player JS variant and client definitions.
 - **deno upgrade**: `systemctl --user restart ytsprint-jsd`.
 - **ytsprint upgrade**: `cargo install ...` again, then `systemctl --user restart ytsprint-jsd`.
-- **YouTube rejects a client** (`web_creator` / `tv_samsung` / `web` version): you get an error; the fix is new values from
-  yt-dlp's `yt_dlp/extractor/youtube/_base.py`.
+- **YouTube rejects a client** (`web_creator` / `tv_samsung` / `web` version): you get an error; the fix
+  arrives with a yt-dlp update, because the definitions are read from your yt-dlp.
 
 ## Environment variables
 

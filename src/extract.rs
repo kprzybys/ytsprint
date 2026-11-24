@@ -4,6 +4,7 @@
 use crate::cookies::{self, Cookie};
 use crate::fsutil;
 use crate::jsc;
+use crate::locate::{InnertubeClient, Settings};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -16,18 +17,6 @@ use url::Url;
 
 pub const WEB_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
-// Client definition copied from yt-dlp 2026.10.26 (_base.py, 'tv_samsung').
-const TV_UA: &str =
-    "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1";
-const TV_CLIENT_NAME: &str = "TVHTML5";
-const TV_CLIENT_ID: &str = "7";
-const TV_CLIENT_VERSION: &str = "5.20260707";
-// Client definition copied from yt-dlp 2026.11.23 (_base.py, 'web_creator'). Only for Premium accounts: without
-// Premium its streams need a PO token. tv_samsung is not used for them, because it shows a pre-roll ad (and the
-// stream is 403 until it ends) on some videos even with Premium.
-const CREATOR_CLIENT_NAME: &str = "WEB_CREATOR";
-const CREATOR_CLIENT_ID: &str = "62";
-const CREATOR_CLIENT_VERSION: &str = "1.20260708.06.00";
 const ORIGIN: &str = "https://www.youtube.com";
 /// A pre-roll wait longer than this is treated as an error rather than a silent long sleep.
 const MAX_PREROLL_WAIT_SECS: f64 = 60.0;
@@ -106,10 +95,9 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
         *t = Instant::now();
     };
 
-    let ytdlp = crate::locate::yt_dlp()?;
-    let player_js = ytdlp.player_js()?;
-    let ejs = jsc::Ejs::at(ytdlp.ejs_dir, &player_js)?;
-    let player = player(&ctx.http, &ctx.sess.player_id, &player_js, &ejs)?;
+    let player_js = &ctx.settings.player_js;
+    let ejs = jsc::Ejs::at(ctx.ejs_dir.clone(), player_js)?;
+    let player = player(&ctx.http, &ctx.sess.player_id, player_js, &ejs)?;
     lap(
         if player.raw.is_none() {
             "player (cache)"
@@ -140,28 +128,21 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
     };
 
     // Player API (+ account headers).
-    let (ua, client_id, client_version, client) = if ctx.sess.premium {
-        let client = json!({
-            "clientName": CREATOR_CLIENT_NAME, "clientVersion": CREATOR_CLIENT_VERSION,
-            "hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0
-        });
-        (WEB_UA, CREATOR_CLIENT_ID, CREATOR_CLIENT_VERSION, client)
+    // web_creator only for Premium accounts: without Premium its streams need a PO token. tv_samsung is not used for
+    // them, because it shows a pre-roll ad (and the stream is 403 until it ends) on some videos even with Premium.
+    let client = if ctx.sess.premium {
+        &ctx.settings.web_creator
     } else {
-        let client = json!({
-            "clientName": TV_CLIENT_NAME, "clientVersion": TV_CLIENT_VERSION,
-            "deviceMake": "Samsung", "deviceModel": "UKS9800", "userAgent": TV_UA,
-            "osName": "Tizen", "osVersion": "2.4.0", "hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0
-        });
-        (TV_UA, TV_CLIENT_ID, TV_CLIENT_VERSION, client)
+        &ctx.settings.tv_samsung
     };
     let body = json!({
-        "context": {"client": client},
+        "context": {"client": client.client},
         "videoId": video_id,
         "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS", "signatureTimestamp": player.sts}},
         "contentCheckOk": true, "racyCheckOk": true
     });
     let requested_at = now_unix();
-    let resp = ctx.post("player", ua, client_id, client_version, &body)?;
+    let resp = ctx.post("player", client, &body)?;
     let status = resp["playabilityStatus"]["status"].as_str().unwrap_or("?");
     if status != "OK" {
         bail!("playabilityStatus {status}: {}", resp["playabilityStatus"]["reason"]);
@@ -353,6 +334,8 @@ pub struct Ctx {
     pub http: Client,
     account: Vec<Cookie>,
     pub sess: Session,
+    pub settings: Settings,
+    ejs_dir: PathBuf,
     session_path: PathBuf,
     use_cookies: bool,
     /// timings of building the context (cookies, session)
@@ -362,6 +345,8 @@ pub struct Ctx {
 impl Ctx {
     /// `page`: path of the page to read the session from when there is none in the cache.
     pub fn new(use_cookies: bool, page: &str) -> Result<Ctx> {
+        let ytdlp = crate::locate::yt_dlp()?;
+        let settings = ytdlp.settings()?;
         let t = Instant::now();
         let jar = Arc::new(Jar::default());
         let yt: Url = ORIGIN.parse()?;
@@ -414,6 +399,8 @@ impl Ctx {
             http,
             account,
             sess,
+            settings,
+            ejs_dir: ytdlp.ejs_dir,
             session_path,
             use_cookies,
             timings,
@@ -433,14 +420,14 @@ impl Ctx {
     }
 
     /// POST /youtubei/v1/<endpoint>; `body` must already contain `context`.
-    pub fn post(&self, endpoint: &str, ua: &str, client_id: &str, client_version: &str, body: &Value) -> Result<Value> {
+    pub fn post(&self, endpoint: &str, client: &InnertubeClient, body: &Value) -> Result<Value> {
         let s = &self.sess;
         let mut req = self
             .http
             .post(format!("{ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false"))
-            .header("User-Agent", ua)
-            .header("X-Youtube-Client-Name", client_id)
-            .header("X-Youtube-Client-Version", client_version)
+            .header("User-Agent", client.user_agent.as_deref().unwrap_or(WEB_UA))
+            .header("X-Youtube-Client-Name", &client.id)
+            .header("X-Youtube-Client-Version", &client.version)
             .header("X-Goog-Visitor-Id", &s.visitor)
             .header("Origin", ORIGIN);
         if self.use_cookies {

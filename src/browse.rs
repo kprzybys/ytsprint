@@ -2,14 +2,11 @@
 //! The parser walks the response recursively and collects video entries and continuation tokens,
 //! so it does not depend on the exact page layout (it changes more often than the renderers do).
 
-use crate::extract::{Ctx, WEB_UA};
+use crate::extract::Ctx;
 use crate::fsutil;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-// Client definition copied from yt-dlp 2026.10.26 (_base.py, 'web').
-const WEB_CLIENT_ID: &str = "1";
-const WEB_CLIENT_VERSION: &str = "2.20260708.00.00";
 // yt-dlp _search.py: videos only
 const SEARCH_VIDEOS: &str = "EgIQAfABAQ==";
 const MAX_PLAYLIST: usize = 5000;
@@ -21,13 +18,10 @@ pub struct Entry {
     pub duration: Option<u64>,
 }
 
-fn context() -> Value {
-    json!({"client": {"clientName": "WEB", "clientVersion": WEB_CLIENT_VERSION, "hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0}})
-}
-
 fn post(ctx: &Ctx, endpoint: &str, mut body: Value) -> Result<Value> {
-    body["context"] = context();
-    ctx.post(endpoint, WEB_UA, WEB_CLIENT_ID, WEB_CLIENT_VERSION, &body)
+    let web = &ctx.settings.web;
+    body["context"] = json!({"client": web.client});
+    ctx.post(endpoint, web, &body)
 }
 
 /// No retry (the error is meant to be visible); after a session error the next run starts with a fresh session.

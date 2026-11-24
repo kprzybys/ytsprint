@@ -53,8 +53,8 @@ mpv receives the list of `entries` and opens each video separately through the p
    writes it to the cache atomically. A damaged cached player is reported, deleted, and prepared on the next play.
    jsd relies on an ejs internal (`Function("_result", prepared)` sets `_result.n/sig`); if that changes, you get
    an error, not a silent failure. Socket timeouts on both sides (15 s), so a stuck jsd is an error, not a hang.
-4. **Client definitions copied from yt-dlp** (`web_creator` and `tv_samsung` in `extract.rs`, `web` in `browse.rs`): when YouTube
-   changes something, it is clear where the new values come from.
+4. **Client definitions read from the installed yt-dlp** (`web_creator`, `tv_samsung`, `web`), by the same plugin as
+   the player JS variant (`ytdlp_probe.py`, `locate.rs`): nothing to copy when YouTube changes something.
 5. **No hidden fallbacks or retries.** Errors are shown in mpv and logged as `ERROR`; after a session-related
    error (HTTP 4xx, logged out) the cached session is dropped so the next run starts fresh. Only what ytsprint
    does not do at all goes to yt-dlp. Non-fatal oddities (no title from oEmbed, a truncated playlist) are logged as `WARN`.
@@ -76,7 +76,7 @@ mpv receives the list of `entries` and opens each video separately through the p
 | session | valid for 1 h, per account and Firefox profile; dropped after a session-related error |
 | deno | `systemctl --user restart ytsprint-jsd` |
 | ytsprint | `cargo install …` + `systemctl --user restart ytsprint-jsd` |
-| YouTube rejects a client | error in mpv and `ERROR` in the log → new values from yt-dlp's `_base.py` |
+| YouTube rejects a client | error in mpv and `ERROR` in the log → yt-dlp update (the definitions are read from it) |
 
 ## Files
 

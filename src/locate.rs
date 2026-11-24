@@ -3,8 +3,8 @@
 //! yt-dlp: $YTSPRINT_YTDLP, otherwise the first `yt-dlp` in PATH that ships ejs — the onedir build
 //! (`_internal/yt_dlp_ejs` next to the binary) or a pip install (the `yt_dlp_ejs` module of the script's interpreter).
 //! ejs: $YTSPRINT_EJS_DIR, otherwise from that yt-dlp. The location is cached (it is checked on every play).
-//! Player JS variant: whatever that yt-dlp uses (asked once per yt-dlp version), because ejs is only known to work
-//! with the variant yt-dlp picks. No built-in default: when yt-dlp cannot tell, it is an error.
+//! Player JS variant and InnerTube clients: whatever that yt-dlp uses (asked once per yt-dlp version), so that its
+//! fixes for YouTube changes arrive with its update. No built-in defaults: when yt-dlp cannot tell, it is an error.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -24,31 +24,92 @@ pub struct YtDlp {
     pub ejs_dir: PathBuf,
 }
 
+/// What ytsprint takes from the installed yt-dlp instead of keeping its own copy.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// path of the player JS under `/s/player/<id>/`
+    pub player_js: String,
+    pub web: InnertubeClient,
+    pub web_creator: InnertubeClient,
+    pub tv_samsung: InnertubeClient,
+}
+
+#[derive(Clone, Debug)]
+pub struct InnertubeClient {
+    /// X-Youtube-Client-Name
+    pub id: String,
+    pub version: String,
+    pub user_agent: Option<String>,
+    /// `context.client` of a request
+    pub client: Value,
+}
+
+impl Settings {
+    fn parse(v: &Value) -> Option<Settings> {
+        let p = v["player_js"].as_str()?;
+        // it becomes part of a URL
+        let ok = p.ends_with(".js")
+            && !p.starts_with('/')
+            && !p.contains("..")
+            && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./".contains(&b));
+        if !ok {
+            return None;
+        }
+        let client = |name: &str| InnertubeClient::parse(&v["clients"][name]);
+        Some(Settings {
+            player_js: p.to_string(),
+            web: client("web")?,
+            web_creator: client("web_creator")?,
+            tv_samsung: client("tv_samsung")?,
+        })
+    }
+}
+
+impl InnertubeClient {
+    fn parse(v: &Value) -> Option<InnertubeClient> {
+        let mut client = v["client"].clone();
+        let version = client["clientVersion"].as_str()?.to_string();
+        let user_agent = client["userAgent"].as_str().map(str::to_string);
+        client["clientName"].as_str()?;
+        // as yt-dlp does in _extract_context
+        client["hl"] = json!("en");
+        client["timeZone"] = json!("UTC");
+        client["utcOffsetMinutes"] = json!(0);
+        Some(InnertubeClient {
+            id: v["id"].as_u64()?.to_string(),
+            version,
+            user_agent,
+            client,
+        })
+    }
+}
+
 impl YtDlp {
-    /// Path of the player JS under `/s/player/<id>/`, as this yt-dlp would download it. Cached until the yt-dlp
-    /// file changes: an update swaps the symlink (onedir) or rewrites the script (pip).
-    pub fn player_js(&self) -> Result<String> {
+    /// The settings of this yt-dlp. Cached until the yt-dlp file changes: an update swaps the symlink (onedir)
+    /// or rewrites the script (pip).
+    pub fn settings(&self) -> Result<Settings> {
         let real = std::fs::canonicalize(&self.bin).with_context(|| format!("resolve {}", self.bin.display()))?;
         let m = std::fs::metadata(&real)?;
-        let id = json!([real, m.size(), m.mtime(), m.mtime_nsec()]);
-        let cache = crate::fsutil::cache_dir()?.join("ytdlp-player-js.json");
+        // the probe is part of the identity: a new ytsprint may ask for more
+        let id = json!([real, m.size(), m.mtime(), m.mtime_nsec(), PROBE_SOURCE]);
+        let cache = crate::fsutil::cache_dir()?.join("ytdlp-settings.json");
         if let Some(v) = std::fs::read_to_string(&cache)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
             && v["ytdlp"] == id
-            && let Some(p) = v["player_js"].as_str()
+            && let Some(s) = Settings::parse(&v["settings"])
         {
-            return Ok(p.to_string());
+            return Ok(s);
         }
-        let path = probe_player_js(&self.bin)?;
-        let v = json!({"ytdlp": id, "player_js": path});
+        let (raw, settings) = probe(&self.bin)?;
+        let v = json!({"ytdlp": id, "settings": raw});
         crate::fsutil::write_atomic(&cache, v.to_string().as_bytes())?;
-        Ok(path)
+        Ok(settings)
     }
 }
 
-/// Asks yt-dlp itself, through a plugin that prints the setting: the onedir build has no .py files to read.
-fn probe_player_js(bin: &Path) -> Result<String> {
+/// Asks yt-dlp itself, through a plugin that prints the settings: the onedir build has no .py files to read.
+fn probe(bin: &Path) -> Result<(Value, Settings)> {
     let plugins = crate::fsutil::cache_dir()?.join("ytdlp-plugin");
     let dir = plugins.join("ytsprint/yt_dlp_plugins/extractor");
     crate::fsutil::private_dir(&dir)?;
@@ -66,7 +127,7 @@ fn probe_player_js(bin: &Path) -> Result<String> {
         if started.elapsed() > PROBE_TIMEOUT {
             child.kill()?;
             child.wait()?;
-            bail!("{}: no answer about the player JS variant", bin.display());
+            bail!("{}: no answer about its settings", bin.display());
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -79,23 +140,18 @@ fn probe_player_js(bin: &Path) -> Result<String> {
     }
     parse_probe(&out).with_context(|| {
         format!(
-            "{}: cannot read the player JS variant (incompatible yt-dlp?): {}",
+            "{}: cannot read its settings (incompatible yt-dlp?): {}",
             bin.display(),
             err.trim().lines().last().unwrap_or("no output")
         )
     })
 }
 
-fn parse_probe(out: &str) -> Option<String> {
+fn parse_probe(out: &str) -> Option<(Value, Settings)> {
     let json = out.lines().find_map(|l| l.strip_prefix("YTSPRINT "))?;
     let v: Value = serde_json::from_str(json).ok()?;
-    let p = v["player_js"].as_str()?;
-    // it becomes part of a URL
-    let ok = p.ends_with(".js")
-        && !p.starts_with('/')
-        && !p.contains("..")
-        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./".contains(&b));
-    ok.then(|| p.to_string())
+    let settings = Settings::parse(&v)?;
+    Some((v, settings))
 }
 
 /// All executable files named `name` in PATH, in order.
@@ -236,12 +292,24 @@ mod tests {
 
     #[test]
     fn probe_output() {
-        let line = |p: &str| format!("noise\nYTSPRINT {{\"player_js\": \"{p}\"}}\n");
+        let client = json!({"id": 7, "client": {"clientName": "TVHTML5", "clientVersion": "5.2", "userAgent": "TV", "hl": "en"}});
+        let line = |path: &str, clients: Value| {
+            format!("noise\nYTSPRINT {}\n", json!({"player_js": path, "clients": clients}))
+        };
+        let all = json!({"web": client, "web_creator": client, "tv_samsung": client});
         let tv = "tv-player-ias.vflset/tv-player-ias.js";
-        assert_eq!(parse_probe(&line(tv)).as_deref(), Some(tv));
+        let (_, s) = parse_probe(&line(tv, all.clone())).unwrap();
+        assert_eq!(s.player_js, tv);
+        let c = &s.tv_samsung;
+        assert_eq!(
+            (c.id.as_str(), c.version.as_str(), c.user_agent.as_deref()),
+            ("7", "5.2", Some("TV"))
+        );
+        assert_eq!(c.client["timeZone"], "UTC");
         for bad in ["", "../x.js", "/x.js", "x.js?a=1", "x.css"] {
-            assert_eq!(parse_probe(&line(bad)), None, "{bad}");
+            assert!(parse_probe(&line(bad, all.clone())).is_none(), "{bad}");
         }
-        assert_eq!(parse_probe("yt-dlp: error: You must provide at least one URL."), None);
+        assert!(parse_probe(&line(tv, json!({"web": client}))).is_none()); // a client is missing
+        assert!(parse_probe("yt-dlp: error: You must provide at least one URL.").is_none());
     }
 }
