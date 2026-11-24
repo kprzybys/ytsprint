@@ -18,9 +18,9 @@ const JSD_SOURCE: &str = include_str!("jsd.js");
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn socket_path() -> Result<PathBuf> {
-    match std::env::var("YTSPRINT_JSD_SOCKET") {
-        Ok(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-        _ => Ok(fsutil::runtime_dir()?.join("ytsprint-jsd.sock")),
+    match fsutil::env_path("YTSPRINT_JSD_SOCKET") {
+        Some(p) => Ok(p),
+        None => Ok(fsutil::runtime_dir()?.join("ytsprint-jsd.sock")),
     }
 }
 
@@ -90,14 +90,14 @@ pub fn run_daemon() -> Result<()> {
     bail!("exec {}: {err}", deno.display())
 }
 
-/// Quoting for a systemd unit value: "…" with \ and " escaped, % and $ doubled.
-fn unit_quote(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%")
-        .replace('$', "$$");
-    format!("\"{escaped}\"")
+/// Quoting for a systemd unit value: "…" with \ and " escaped, % doubled. Not for ExecStart arguments, where
+/// $ would need doubling too; the executable path and Environment= do not expand it.
+fn unit_quote(s: &str) -> Result<String> {
+    if s.chars().any(char::is_control) {
+        bail!("control character in {s:?}");
+    }
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%");
+    Ok(format!("\"{escaped}\""))
 }
 
 /// `ytsprint install-service`: writes ~/.config/systemd/user/ytsprint-jsd.service with absolute paths
@@ -121,7 +121,7 @@ pub fn install_service() -> Result<()> {
          [Service]\n\
          Environment={}\n\
          ExecStart={} jsd\n\
-         Restart=on-failure\n\
+         Restart=always\n\
          RestartSec=2\n\
          # deno itself only gets the socket (see jsd.js); these limit the process further\n\
          NoNewPrivileges=yes\n\
@@ -131,8 +131,8 @@ pub fn install_service() -> Result<()> {
          RestrictSUIDSGID=yes\n\n\
          [Install]\n\
          WantedBy=default.target\n",
-        unit_quote(&format!("YTSPRINT_DENO={}", deno.display())),
-        unit_quote(&exe.display().to_string()),
+        unit_quote(&format!("YTSPRINT_DENO={}", deno.display()))?,
+        unit_quote(&exe.display().to_string())?,
     );
     fsutil::write_atomic(&unit, text.as_bytes())?;
     for args in [
@@ -163,6 +163,20 @@ pub struct Player<'a> {
     pub raw: Option<&'a str>,
 }
 
+fn restart_stuck_jsd() -> &'static str {
+    if fsutil::env_path("YTSPRINT_JSD_SOCKET").is_some() {
+        return "ytsprint-jsd is stuck (custom socket: restart it yourself)";
+    }
+    let st = Command::new("systemctl")
+        .args(["--user", "restart", "ytsprint-jsd"])
+        .status();
+    if st.is_ok_and(|s| s.success()) {
+        "ytsprint-jsd was stuck and has been restarted"
+    } else {
+        "ytsprint-jsd is stuck and could not be restarted"
+    }
+}
+
 fn exchange(sock: &Path, req: &Value) -> Result<Value> {
     let mut conn = UnixStream::connect(sock).with_context(|| {
         format!(
@@ -175,9 +189,16 @@ fn exchange(sock: &Path, req: &Value) -> Result<Value> {
     conn.write_all(format!("{req}\n").as_bytes())
         .context("ytsprint-jsd: sending the request")?;
     let mut line = String::new();
-    BufReader::new(conn)
-        .read_line(&mut line)
-        .context("ytsprint-jsd: no response (stuck or crashed?)")?;
+    if let Err(e) = BufReader::new(conn).read_line(&mut line) {
+        use std::io::ErrorKind::{TimedOut, WouldBlock};
+        let stuck = matches!(e.kind(), TimedOut | WouldBlock);
+        let err = anyhow!(e).context("ytsprint-jsd: no response");
+        // player code in an endless loop blocks jsd for good; this play fails, the next one gets a fresh jsd
+        return Err(if stuck { err.context(restart_stuck_jsd()) } else { err });
+    }
+    if line.is_empty() {
+        bail!("ytsprint-jsd: exited while answering; journalctl --user -u ytsprint-jsd");
+    }
     serde_json::from_str(&line).context("ytsprint-jsd: invalid response")
 }
 
@@ -247,7 +268,8 @@ mod tests {
 
     #[test]
     fn unit_values_are_quoted() {
-        assert_eq!(unit_quote("/a b/x"), "\"/a b/x\"");
-        assert_eq!(unit_quote("50%$\"\\"), "\"50%%$$\\\"\\\\\"");
+        assert_eq!(unit_quote("/a b/x").unwrap(), "\"/a b/x\"");
+        assert_eq!(unit_quote("50%$\"\\").unwrap(), "\"50%%$\\\"\\\\\"");
+        assert!(unit_quote("/a\nExecStartPre=x").is_err());
     }
 }

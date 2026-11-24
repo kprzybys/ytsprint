@@ -10,6 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOG_MAX_BYTES: u64 = 1 << 20;
 
+/// A path from the environment; empty counts as unset.
+pub fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 fn home() -> Result<String> {
     std::env::var("HOME").context("HOME is not set")
 }
@@ -87,7 +92,10 @@ pub fn log(line: &str) {
 fn try_log(line: &str) -> Result<()> {
     let path = state_dir()?.join("log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
-        std::fs::rename(&path, path.with_extension("1"))?;
+        match std::fs::rename(&path, path.with_extension("1")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {} // NotFound: another process rotated it just now
+        }
     }
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let mut f = OpenOptions::new().create(true).append(true).mode(0o600).open(&path)?;

@@ -6,18 +6,20 @@
 //! Player JS variant and InnerTube clients: whatever that yt-dlp uses (asked once per yt-dlp version), so that its
 //! fixes for YouTube changes arrive with its update. No built-in defaults: when yt-dlp cannot tell, it is an error.
 
+use crate::fsutil::env_path;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SOLVER_SUBDIR: &str = "yt_dlp_ejs/yt/solver";
 const PROBE_SOURCE: &str = include_str!("ytdlp_probe.py");
 /// Starting yt-dlp takes ~0.6 s (no network); anything near this limit means it is stuck.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const RUN_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct YtDlp {
     pub bin: PathBuf,
@@ -108,36 +110,59 @@ impl YtDlp {
     }
 }
 
+/// Runs a program to the end with RUN_TIMEOUT. Both pipes are read while it runs (a full pipe would block it).
+fn run(cmd: &mut Command) -> Result<(ExitStatus, String, String)> {
+    let what = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {what}"))?;
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    fn reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = vec![];
+            let _ = pipe.read_to_end(&mut buf); // what was read before an error is still useful
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        rx
+    }
+    let out = reader(child.stdout.take().context("stdout")?);
+    let err = reader(child.stderr.take().context("stderr")?);
+    // the pipes close when the program ends; a timeout is measured for all three together
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let result = out
+        .recv_timeout(left())
+        .and_then(|o| Ok((o, err.recv_timeout(left())?)));
+    let Ok((out, err)) = result else {
+        child.kill()?;
+        child.wait()?;
+        bail!("{what}: no answer in {} s", RUN_TIMEOUT.as_secs());
+    };
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, out, err));
+        }
+        if left().is_zero() {
+            child.kill()?;
+            child.wait()?;
+            bail!("{what}: did not exit in {} s", RUN_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Asks yt-dlp itself, through a plugin that prints the settings: the onedir build has no .py files to read.
 fn probe(bin: &Path) -> Result<(Value, Settings)> {
     let plugins = crate::fsutil::cache_dir()?.join("ytdlp-plugin");
     let dir = plugins.join("ytsprint/yt_dlp_plugins/extractor");
     crate::fsutil::private_dir(&dir)?;
     crate::fsutil::write_atomic(&dir.join("ytsprint_probe.py"), PROBE_SOURCE.as_bytes())?;
-    let mut child = Command::new(bin)
+    let (_, out, err) = run(Command::new(bin)
         .args(["--ignore-config", "--no-plugin-dirs", "--plugin-dirs"])
-        .arg(&plugins)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("run {}", bin.display()))?;
-    let started = Instant::now();
-    while child.try_wait()?.is_none() {
-        if started.elapsed() > PROBE_TIMEOUT {
-            child.kill()?;
-            child.wait()?;
-            bail!("{}: no answer about its settings", bin.display());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let (mut out, mut err) = (String::new(), String::new());
-    if let Some(mut s) = child.stdout.take() {
-        s.read_to_string(&mut out)?;
-    }
-    if let Some(mut s) = child.stderr.take() {
-        s.read_to_string(&mut err)?;
-    }
+        .arg(&plugins))?;
     parse_probe(&out).with_context(|| {
         format!(
             "{}: cannot read its settings (incompatible yt-dlp?): {}",
@@ -174,15 +199,34 @@ fn has_solver(dir: &Path) -> bool {
 }
 
 /// ejs for a given yt-dlp binary, or None when that yt-dlp does not ship it (e.g. an old distro package).
-fn ejs_for(bin: &Path) -> Option<PathBuf> {
+/// An interpreter that hangs is an error.
+fn ejs_for(bin: &Path) -> Result<Option<PathBuf>> {
+    let Some((interp, onedir)) = ejs_candidates(bin) else {
+        return Ok(None);
+    };
+    if has_solver(&onedir) {
+        return Ok(Some(onedir));
+    }
+    let Some(interp) = interp else { return Ok(None) };
+    // pip / pipx: a Python script; ask its interpreter (from the shebang) where yt_dlp_ejs is
+    let (status, out, _) = run(Command::new(interp).args([
+        "-c",
+        "import os, yt_dlp_ejs; print(os.path.dirname(yt_dlp_ejs.__file__))",
+    ]))?;
+    let dir = PathBuf::from(out.trim()).join("yt").join("solver");
+    Ok((status.success() && has_solver(&dir)).then_some(dir))
+}
+
+/// The Python interpreter of a script (None for other files) and where the onedir build keeps ejs.
+fn ejs_candidates(bin: &Path) -> Option<(Option<String>, PathBuf)> {
     let real = std::fs::canonicalize(bin).ok()?;
     // onedir build: <dir>/yt-dlp + <dir>/_internal/yt_dlp_ejs/...
     let onedir = real.parent()?.join("_internal").join(SOLVER_SUBDIR);
-    if has_solver(&onedir) {
-        return Some(onedir);
-    }
-    // pip / pipx: a Python script; ask its interpreter (from the shebang) where yt_dlp_ejs is
-    let head = std::fs::read(&real).ok()?;
+    Some((python_of(&real), onedir))
+}
+
+fn python_of(real: &Path) -> Option<String> {
+    let head = std::fs::read(real).ok()?;
     let first = head.split(|b| *b == b'\n').next()?;
     let shebang = std::str::from_utf8(first).ok()?.strip_prefix("#!")?.trim();
     let mut parts = shebang.split_whitespace();
@@ -190,28 +234,16 @@ fn ejs_for(bin: &Path) -> Option<PathBuf> {
     if interp.ends_with("/env") {
         interp = parts.next()?.to_string();
     }
-    if !interp.contains("python") {
-        return None;
-    }
-    let out = Command::new(interp)
-        .args([
-            "-c",
-            "import os, yt_dlp_ejs; print(os.path.dirname(yt_dlp_ejs.__file__))",
-        ])
-        .output()
-        .ok()?;
-    let pkg = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
-    let dir = pkg.join("yt").join("solver");
-    (out.status.success() && has_solver(&dir)).then_some(dir)
+    interp.contains("python").then_some(interp)
 }
 
 pub fn yt_dlp() -> Result<YtDlp> {
     // candidates: $YTSPRINT_YTDLP alone, otherwise every yt-dlp in PATH in order
-    let candidates = match std::env::var("YTSPRINT_YTDLP") {
-        Ok(bin) => vec![PathBuf::from(bin)],
-        Err(_) => in_path("yt-dlp"),
+    let candidates = match env_path("YTSPRINT_YTDLP") {
+        Some(bin) => vec![bin],
+        None => in_path("yt-dlp"),
     };
-    let env_ejs = std::env::var("YTSPRINT_EJS_DIR").ok().map(PathBuf::from);
+    let env_ejs = env_path("YTSPRINT_EJS_DIR");
     let cache_file = crate::fsutil::cache_dir()?.join("ytdlp-location.json");
     // cache: valid while the candidate list is unchanged, the chosen binary still points to the same file
     // (a yt-dlp update swaps the symlink to a new version) and the ejs directory exists
@@ -236,7 +268,7 @@ pub fn yt_dlp() -> Result<YtDlp> {
         }
     }
     for bin in &candidates {
-        if let Some(ejs) = ejs_for(bin) {
+        if let Some(ejs) = ejs_for(bin)? {
             let real = std::fs::canonicalize(bin).with_context(|| format!("resolve {}", bin.display()))?;
             let v = json!({"candidates": candidates, "bin": bin, "real": real, "ejs_dir": ejs});
             crate::fsutil::write_atomic(&cache_file, v.to_string().as_bytes())?;
@@ -251,7 +283,7 @@ pub fn yt_dlp() -> Result<YtDlp> {
     }
     bail!(
         "no yt-dlp with the ejs solver ({}); install a current yt-dlp \
-         (onedir build or `pip install \"yt-dlp[default]\"`) or set YTSPRINT_EJS_DIR",
+         (onedir build or `pip install \"yt-dlp[default]\"`)",
         candidates
             .iter()
             .map(|c| c.display().to_string())
@@ -266,10 +298,7 @@ pub fn yt_dlp_for_routing() -> Result<PathBuf> {
     match yt_dlp() {
         Ok(y) => Ok(y.bin),
         Err(e) => {
-            let first = std::env::var("YTSPRINT_YTDLP")
-                .map(PathBuf::from)
-                .ok()
-                .or_else(|| in_path("yt-dlp").into_iter().next());
+            let first = env_path("YTSPRINT_YTDLP").or_else(|| in_path("yt-dlp").into_iter().next());
             first.with_context(|| format!("no yt-dlp to route to: {e:#}"))
         }
     }
@@ -277,8 +306,8 @@ pub fn yt_dlp_for_routing() -> Result<PathBuf> {
 
 /// deno: $YTSPRINT_DENO or the first one in PATH.
 pub fn deno() -> Result<PathBuf> {
-    if let Ok(d) = std::env::var("YTSPRINT_DENO") {
-        return Ok(PathBuf::from(d));
+    if let Some(d) = env_path("YTSPRINT_DENO") {
+        return Ok(d);
     }
     in_path("deno")
         .into_iter()

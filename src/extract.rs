@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
+/// Not taken from yt-dlp, which picks a random Chrome version: with Chrome 152+ YouTube breaks off our HTTP/2
+/// connections (tested 2026-11-24 with reqwest 0.13/rustls: 145-151 work, 152-157 do not).
 pub const WEB_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const ORIGIN: &str = "https://www.youtube.com";
@@ -108,7 +110,7 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
     );
 
     // The tv_samsung client returns no title: oEmbed in the background, alongside player API + jsc.
-    let title_job = {
+    let title_job = (!ctx.sess.premium).then(|| {
         let http = ctx.http.clone();
         let id = video_id.to_string();
         std::thread::spawn(move || -> Result<String> {
@@ -125,7 +127,7 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
                 .map(str::to_string)
                 .context("oEmbed without a title")
         })
-    };
+    });
 
     // Player API (+ account headers).
     // web_creator only for Premium accounts: without Premium its streams need a PO token. tv_samsung is not used for
@@ -230,14 +232,17 @@ fn bestaudio_with(ctx: &Ctx, video_id: &str) -> Result<Audio> {
     let d = &resp["videoDetails"];
     let title = match d["title"].as_str() {
         Some(t) => t.to_string(),
-        None => match title_job.join() {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => {
-                crate::fsutil::log(&format!("WARN title {video_id}: {e:#}"));
+        None => {
+            let title = match title_job.map(|j| j.join()) {
+                Some(Ok(t)) => t,
+                Some(Err(_)) => bail!("title thread panicked"),
+                None => Err(anyhow::anyhow!("no title in the player response")),
+            };
+            title.unwrap_or_else(|e| {
+                fsutil::log(&format!("WARN title {video_id}: {e:#}"));
                 video_id.to_string()
-            }
-            Err(_) => bail!("title thread panicked"),
-        },
+            })
+        }
     };
     lap("title", &mut t);
     Ok(Audio {
@@ -464,7 +469,8 @@ impl Ctx {
         // diagnostics: YTSPRINT_DUMP=<dir> saves the API responses
         if let Ok(dir) = std::env::var("YTSPRINT_DUMP") {
             let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
-            std::fs::write(format!("{dir}/{endpoint}-{n:02}.json"), v.to_string())
+            let file = PathBuf::from(format!("{dir}/{endpoint}-{n:02}.json"));
+            fsutil::write_atomic(&file, v.to_string().as_bytes()) // 0600: private data
                 .with_context(|| format!("YTSPRINT_DUMP {dir}"))?;
         }
         Ok(v)
@@ -605,24 +611,43 @@ fn player(http: &Client, player_id: &str, player_js: &str, ejs: &jsc::Ejs) -> Re
         .send()?
         .error_for_status()?
         .text()?;
-    let sts: u64 = capture(r"(?:signatureTimestamp|sts)\s*:\s*([0-9]{5})", &raw)
+    let sts: u64 = capture(r"\b(?:signatureTimestamp|sts)\s*:\s*([0-9]{5})", &raw)
         .context("no sts in player JS")?
         .parse()?;
     fsutil::write_atomic(&sts_file, sts.to_string().as_bytes())?;
-    // A new player or a new ejs: the files of older players are no longer needed (~4 MB each).
-    // Temporary files of other processes (".tmp-<pid>") are left alone.
-    for e in std::fs::read_dir(&dir)?.flatten() {
-        let p = e.path();
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with("player-") && !name.contains(".tmp-") && p != sts_file && p != pre_file {
-            std::fs::remove_file(&p).with_context(|| format!("remove old {}", p.display()))?;
-        }
-    }
+    remove_old_players(&dir, &[&sts_file, &pre_file])?;
     Ok(PlayerData {
         sts,
         pre_path: pre_file,
         raw: Some(raw),
     })
+}
+
+/// After a new player or a new ejs the files of older ones are no longer needed (~4 MB each), except the newest
+/// other one of each kind: a process that started just before may still be using it. Temporary files of other
+/// processes (".tmp-<pid>") are left alone; a file another process removed first is fine.
+fn remove_old_players(dir: &std::path::Path, current: &[&PathBuf]) -> Result<()> {
+    for kind in [".sts", ".pre.js"] {
+        let mut old: Vec<_> = std::fs::read_dir(dir)?
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("player-") && name.ends_with(kind) && !current.contains(&&e.path())
+            })
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .collect();
+        old.sort();
+        old.pop();
+        for (_, p) in old {
+            match std::fs::remove_file(&p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(e).with_context(|| format!("remove old {}", p.display()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -648,6 +673,39 @@ mod tests {
         let inf = json!({"adSlots": [{"adSlotRenderer": {"adSlotMetadata": {"triggerEvent": "SLOT_TRIGGER_EVENT_BEFORE_CONTENT"},
             "fulfillmentContent": {"instreamVideoAdRenderer": {"playerVars": "length_seconds=inf"}}}}]});
         assert!(!preroll_wait(&inf).is_finite()); // rejected by the caller
+    }
+
+    #[test]
+    fn old_players_are_removed_except_the_previous_one() {
+        let dir = std::env::temp_dir().join(format!("ytsprint-test-players-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, age) in [("c", 0), ("b", 10), ("a", 20)] {
+            for kind in ["sts", "pre.js"] {
+                let f = std::fs::File::create(dir.join(format!("player-{id}.{kind}"))).unwrap();
+                f.set_modified(SystemTime::now() - Duration::from_secs(age)).unwrap();
+            }
+        }
+        std::fs::write(dir.join("player-x.tmp-1"), "").unwrap();
+        std::fs::write(dir.join("session-x.json"), "").unwrap();
+        remove_old_players(&dir, &[&dir.join("player-c.sts"), &dir.join("player-c.pre.js")]).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "player-b.pre.js",
+                "player-b.sts",
+                "player-c.pre.js",
+                "player-c.sts",
+                "player-x.tmp-1",
+                "session-x.json"
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

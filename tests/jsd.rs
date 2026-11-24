@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -54,8 +55,8 @@ fn start() -> Jsd {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // 0700 and not pre-created by anyone else
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let sock = dir.join("jsd.sock");
     let s = sock.to_str().unwrap();
     let child = Command::new(deno())
@@ -74,16 +75,18 @@ fn start() -> Jsd {
         .arg(s)
         .spawn()
         .expect("start deno");
-    let t = Instant::now();
-    while UnixStream::connect(&sock).is_err() {
-        assert!(t.elapsed() < Duration::from_secs(20), "jsd did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Jsd {
+    // owned before the wait: a failed start must not leave deno running
+    let jsd = Jsd {
         child,
         sock,
         _dir: tempdir::Dir(dir),
+    };
+    let t = Instant::now();
+    while UnixStream::connect(&jsd.sock).is_err() {
+        assert!(t.elapsed() < Duration::from_secs(20), "jsd did not start");
+        std::thread::sleep(Duration::from_millis(50));
     }
+    jsd
 }
 
 fn ask(jsd: &Jsd, req: &Value) -> Value {

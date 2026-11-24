@@ -52,7 +52,9 @@ mpv receives the list of `entries` and opens each video separately through the p
    the scripts / the prepared player / the raw player. A raw player is prepared once and returned, and the client
    writes it to the cache atomically. A damaged cached player is reported, deleted, and prepared on the next play.
    jsd relies on an ejs internal (`Function("_result", prepared)` sets `_result.n/sig`); if that changes, you get
-   an error, not a silent failure. Socket timeouts on both sides (15 s), so a stuck jsd is an error, not a hang.
+   an error, not a silent failure. Socket timeouts on both sides (15 s): a stuck jsd (player code in an endless
+   loop) is an error, not a hang, and the client restarts it for the next play; after any exit systemd starts it
+   again (`Restart=always`).
 4. **Client definitions read from the installed yt-dlp** (`web_creator`, `tv_samsung`, `web`), by the same plugin as
    the player JS variant (`ytdlp_probe.py`, `locate.rs`): nothing to copy when YouTube changes something.
 5. **No hidden fallbacks or retries.** Errors are shown in mpv and logged as `ERROR`; after a session-related
@@ -71,7 +73,7 @@ mpv receives the list of `entries` and opens each video separately through the p
 
 | What changes | What happens |
 |---|---|
-| YouTube player (every few days) | new ID in the session → base.js downloaded → jsd prepares it once (~1.2 s) → older `player-*` files deleted |
+| YouTube player (every few days) | new ID in the session → base.js downloaded → jsd prepares it once (~1.2 s) → `player-*` files deleted, except the previous player's |
 | yt-dlp / ejs | the ejs tag (size + mtime of its files) is part of `player-<id>-ejs<tag>.pre.js` and of jsd's state → jsd asks for the new scripts and the player is prepared again; the yt-dlp location cache is invalidated when the binary points elsewhere |
 | session | valid for 1 h, per account and Firefox profile; dropped after a session-related error |
 | deno | `systemctl --user restart ytsprint-jsd` |

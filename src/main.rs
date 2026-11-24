@@ -98,7 +98,7 @@ struct Request {
     cookies: bool,
 }
 
-/// The subset of yt-dlp arguments that mpv (ytdl_hook) passes. Anything unknown → None (fallback).
+/// The subset of yt-dlp arguments that mpv (ytdl_hook) passes. Anything unknown → None (yt-dlp).
 fn parse_ytdl_args(args: &[String]) -> Option<Request> {
     let (mut json, mut format_ok, mut cookies, mut url, mut no_playlist) = (false, false, false, None, false);
     let mut it = args.iter();

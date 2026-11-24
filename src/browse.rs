@@ -4,12 +4,13 @@
 
 use crate::extract::Ctx;
 use crate::fsutil;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 // yt-dlp _search.py: videos only
 const SEARCH_VIDEOS: &str = "EgIQAfABAQ==";
 const MAX_PLAYLIST: usize = 5000;
+const MAX_PLAYLIST_PAGES: usize = 500;
 const MAX_SEARCH_PAGES: usize = 10;
 
 pub struct Entry {
@@ -21,7 +22,12 @@ pub struct Entry {
 fn post(ctx: &Ctx, endpoint: &str, mut body: Value) -> Result<Value> {
     let web = &ctx.settings.web;
     body["context"] = json!({"client": web.client});
-    ctx.post(endpoint, web, &body)
+    let v = ctx.post(endpoint, web, &body)?;
+    // YouTube reports some errors as an alert in a 200 response, on any page
+    if let Some(alert) = alert(&v) {
+        bail!("{alert}");
+    }
+    Ok(v)
 }
 
 /// No retry (the error is meant to be visible); after a session error the next run starts with a fresh session.
@@ -36,10 +42,8 @@ fn with_ctx<T>(use_cookies: bool, page: &str, f: impl Fn(&Ctx) -> Result<T>) -> 
 
 pub fn playlist(list_id: &str, use_cookies: bool) -> Result<(String, Vec<Entry>)> {
     with_ctx(use_cookies, &format!("/playlist?list={list_id}"), |ctx| {
-        let first = post(ctx, "browse", json!({"browseId": format!("VL{list_id}")}))?;
-        if let Some(alert) = alert(&first) {
-            anyhow::bail!("playlist {list_id}: {alert}");
-        }
+        let post = |body| post(ctx, "browse", body);
+        let first = post(json!({"browseId": format!("VL{list_id}")}))?;
         let title = match first["metadata"]["playlistMetadataRenderer"]["title"]
             .as_str()
             .or_else(|| first["header"]["pageHeaderRenderer"]["pageTitle"].as_str())
@@ -52,23 +56,32 @@ pub fn playlist(list_id: &str, use_cookies: bool) -> Result<(String, Vec<Entry>)
         };
         let mut entries = vec![];
         let mut page = first;
-        loop {
+        let mut tokens = std::collections::HashSet::new();
+        // a page without playable entries is normal (all of them deleted), a repeated token is not
+        let truncated = loop {
             let mut conts = vec![];
             walk(&page, &mut entries, &mut conts);
-            match conts.pop() {
-                Some(token) if entries.len() < MAX_PLAYLIST => {
-                    page = post(ctx, "browse", json!({"continuation": token}))?
-                }
-                _ => break,
+            dedup(&mut entries);
+            let Some(token) = conts.pop() else {
+                break entries.len() > MAX_PLAYLIST;
+            };
+            if entries.len() >= MAX_PLAYLIST || tokens.len() >= MAX_PLAYLIST_PAGES {
+                break true;
             }
-        }
-        dedup(&mut entries);
-        if entries.len() >= MAX_PLAYLIST {
-            fsutil::log(&format!("WARN playlist {list_id}: truncated to {MAX_PLAYLIST} entries"));
-            entries.truncate(MAX_PLAYLIST);
+            if !tokens.insert(token.clone()) {
+                bail!("YouTube repeats the same page");
+            }
+            page = post(json!({"continuation": token}))?;
+        };
+        entries.truncate(MAX_PLAYLIST);
+        if truncated {
+            fsutil::log(&format!(
+                "WARN playlist {list_id}: truncated to {} entries",
+                entries.len()
+            ));
         }
         if entries.is_empty() {
-            anyhow::bail!("playlist {list_id}: no entries");
+            bail!("no entries");
         }
         Ok((title, entries))
     })
@@ -243,6 +256,14 @@ mod tests {
             ]
         );
         assert_eq!(conts, ["TOKEN-1"]);
+    }
+
+    #[test]
+    fn error_alerts() {
+        let a = |t: &str| json!({"alerts": [{"alertRenderer": {"type": t, "text": {"runs": [{"text": "Gone."}]}}}]});
+        assert_eq!(alert(&a("ERROR")).as_deref(), Some("Gone."));
+        assert_eq!(alert(&a("INFO")), None); // e.g. "unavailable videos are hidden"
+        assert_eq!(alert(&json!({})), None);
     }
 
     #[test]

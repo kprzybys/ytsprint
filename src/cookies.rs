@@ -16,16 +16,24 @@ pub struct Cookie {
 }
 
 /// The cookies.sqlite file: $YTSPRINT_FIREFOX_PROFILE, otherwise the most recently modified one
-/// under ~/.mozilla/firefox (yt-dlp does the same).
+/// in the Firefox directories (the same ones as yt-dlp).
 fn cookies_db() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("YTSPRINT_FIREFOX_PROFILE") {
-        return Ok(PathBuf::from(p).join("cookies.sqlite"));
+    if let Some(p) = crate::fsutil::env_path("YTSPRINT_FIREFOX_PROFILE") {
+        return Ok(p.join("cookies.sqlite"));
     }
-    let home = std::env::var("HOME")?;
+    let home = PathBuf::from(std::env::var("HOME")?);
+    let config = crate::fsutil::env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+    newest_cookies_db(&home, &config)
+}
+
+fn newest_cookies_db(home: &Path, config: &Path) -> Result<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for base in [
-        format!("{home}/.mozilla/firefox"),
-        format!("{home}/snap/firefox/common/.mozilla/firefox"),
+        config.join("mozilla/firefox"), // new installations since Firefox 147
+        home.join(".mozilla/firefox"),
+        home.join(".var/app/org.mozilla.firefox/config/mozilla/firefox"), // Flatpak
+        home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+        home.join("snap/firefox/common/.mozilla/firefox"),
     ] {
         let Ok(dir) = std::fs::read_dir(base) else { continue };
         for e in dir.flatten() {
@@ -49,6 +57,13 @@ fn cookies_db() -> Result<PathBuf> {
 pub fn firefox_youtube() -> Result<(Vec<Cookie>, PathBuf)> {
     let db = cookies_db()?;
     let tmp = crate::fsutil::runtime_dir()?.join(format!("ytsprint-cookies-{}", std::process::id()));
+    // left by a killed process with the same PID: its WAL must not be applied to the new copy
+    match std::fs::remove_dir_all(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("remove stale {}", tmp.display()));
+        }
+        _ => {}
+    }
     crate::fsutil::private_dir(&tmp)?;
     let result = read_copy(&db, &tmp);
     let _ = std::fs::remove_dir_all(&tmp); // best effort: it is our own private temp dir
@@ -185,6 +200,27 @@ mod tests {
         let jar = [c("__Secure-3PAPISID", "three")];
         let got = sid_authorization_at(&jar, "https://www.youtube.com", None, "1").unwrap();
         assert!(got.starts_with("SAPISIDHASH 1_") && got.contains(" SAPISID3PHASH 1_"));
+    }
+
+    #[test]
+    fn finds_the_newest_profile_in_any_firefox_directory() {
+        let home = std::env::temp_dir().join(format!("ytsprint-test-ff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config");
+        assert!(newest_cookies_db(&home, &config).is_err());
+        let db = |dir: &str, age: u64| {
+            let d = home.join(dir).join("x.default");
+            std::fs::create_dir_all(&d).unwrap();
+            let f = std::fs::File::create(d.join("cookies.sqlite")).unwrap();
+            f.set_modified(SystemTime::now() - std::time::Duration::from_secs(age))
+                .unwrap();
+            d.join("cookies.sqlite")
+        };
+        let old = db(".mozilla/firefox", 100);
+        assert_eq!(newest_cookies_db(&home, &config).unwrap(), old);
+        let xdg = db(".config/mozilla/firefox", 10);
+        assert_eq!(newest_cookies_db(&home, &config).unwrap(), xdg);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
